@@ -1,0 +1,390 @@
+import os
+import sys
+import glob
+import numpy as np
+import pandas as pd
+import tifffile as tiff
+from astropy.io import fits
+
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton, 
+                             QLabel, QVBoxLayout, QHBoxLayout, QFileDialog, 
+                             QSlider, QFrame, QSplitter, QListWidget, QListWidgetItem,
+                             QTextEdit, QComboBox)
+import pyqtgraph as pg
+
+class CappelWidefieldAnalyzer(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Cappel-Widefield - Interactive Data & Spatial Analyzer")
+        self.resize(1500, 850)
+        
+        # State Data
+        self.root_directory = r"C:\Users\calap\Box\(L2 Sensitive) zhan2017\Zhang lab data\AAppel\Widefield RPOC\2026-08-04"
+        self.stack = None
+        self.metadata = {}
+        self.effective_fps = 87.0
+        self.current_frame_idx = 0
+        
+        self.init_ui()
+        self.scan_root_directory(self.root_directory)
+        
+    def init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QHBoxLayout(main_widget)
+        
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(splitter)
+        
+        # ================= 1. SIDEBAR DATASET BROWSER =================
+        sidebar_widget = QWidget()
+        sidebar_layout = QVBoxLayout(sidebar_widget)
+        sidebar_layout.setContentsMargins(5, 5, 5, 5)
+        
+        sidebar_layout.addWidget(QLabel("<b>📁 TRIAL DATASETS</b>"))
+        self.btn_change_dir = QPushButton("Change Directory...")
+        self.btn_change_dir.clicked.connect(self.browse_root_directory)
+        sidebar_layout.addWidget(self.btn_change_dir)
+        
+        self.list_trials = QListWidget()
+        self.list_trials.itemSelectionChanged.connect(self.on_trial_selected)
+        self.list_trials.itemEntered.connect(self.on_trial_hovered)
+        self.list_trials.setMouseTracking(True)
+        sidebar_layout.addWidget(self.list_trials, stretch=1)
+        
+        sidebar_layout.addWidget(QLabel("<b>📋 METADATA SUMMARY</b>"))
+        self.txt_metadata = QTextEdit()
+        self.txt_metadata.setReadOnly(True)
+        self.txt_metadata.setPlaceholderText("Select or hover over a trial to view metadata parameters...")
+        self.txt_metadata.setFixedHeight(180)
+        sidebar_layout.addWidget(self.txt_metadata)
+        
+        splitter.addWidget(sidebar_widget)
+        
+        # ================= 2. MIDDLE VIEWPORT & CONTROLS =================
+        center_widget = QWidget()
+        center_layout = QVBoxLayout(center_widget)
+        
+        self.lbl_trial_header = QLabel("<b>No Dataset Loaded</b>")
+        center_layout.addWidget(self.lbl_trial_header)
+        
+        self.image_canvas = pg.GraphicsLayoutWidget()
+        self.image_plot = self.image_canvas.addPlot()
+        self.image_plot.setAspectLocked(True)
+        self.image_plot.invertY(True)
+        self.image_plot.hideAxis('left')
+        self.image_plot.hideAxis('bottom')
+        
+        self.image_item = pg.ImageItem()
+        self.image_plot.addItem(self.image_item)
+        
+        self.roi = pg.RectROI([100, 100], [100, 100], pen=pg.mkPen('#3aafa9', width=2))
+        self.roi.addScaleHandle([1, 1], [0, 0])
+        self.image_plot.addItem(self.roi)
+        self.roi.sigRegionChanged.connect(self.update_analysis_plot)
+        
+        center_layout.addWidget(self.image_canvas, stretch=1)
+        
+        frame_bar = QHBoxLayout()
+        frame_bar.addWidget(QLabel("Frame:"))
+        self.slider_frame = QSlider(Qt.Orientation.Horizontal)
+        self.slider_frame.setEnabled(False)
+        self.slider_frame.valueChanged.connect(self.on_frame_slider_moved)
+        self.lbl_frame_idx = QLabel("0 / 0 (0.00s)")
+        frame_bar.addWidget(self.slider_frame)
+        frame_bar.addWidget(self.lbl_frame_idx)
+        center_layout.addLayout(frame_bar)
+        
+        contrast_box = QFrame()
+        contrast_box.setFrameShape(QFrame.Shape.StyledPanel)
+        c_layout = QVBoxLayout(contrast_box)
+        c_layout.addWidget(QLabel("<b>🎨 CONTRAST & BRIGHTNESS STRETCH</b>"))
+        
+        min_bar = QHBoxLayout()
+        min_bar.addWidget(QLabel("Black Point (Min):"))
+        self.slider_min = QSlider(Qt.Orientation.Horizontal)
+        self.slider_min.valueChanged.connect(self.update_image_display)
+        min_bar.addWidget(self.slider_min)
+        c_layout.addLayout(min_bar)
+        
+        max_bar = QHBoxLayout()
+        max_bar.addWidget(QLabel("White Point (Max):"))
+        self.slider_max = QSlider(Qt.Orientation.Horizontal)
+        self.slider_max.valueChanged.connect(self.update_image_display)
+        max_bar.addWidget(self.slider_max)
+        c_layout.addLayout(max_bar)
+        
+        btn_auto_contrast = QPushButton("✨ Auto-Stretch Contrast")
+        btn_auto_contrast.clicked.connect(self.auto_stretch_contrast)
+        c_layout.addWidget(btn_auto_contrast)
+        
+        center_layout.addWidget(contrast_box)
+        splitter.addWidget(center_widget)
+        
+        # ================= 3. RIGHT GRAPH & PLOT ANALYSIS PANEL =================
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("<b>📈 ANALYSIS MODE:</b>"))
+        self.cmb_plot_mode = QComboBox()
+        self.cmb_plot_mode.addItems([
+            "Spatial 1D Profile (X-Axis Projection)", 
+            "Spatial 1D Profile (Y-Axis Projection)", 
+            "Temporal Z-Trace (Multi-Frame Kinetics)"
+        ])
+        self.cmb_plot_mode.currentIndexChanged.connect(self.update_analysis_plot)
+        mode_layout.addWidget(self.cmb_plot_mode, stretch=1)
+        right_layout.addLayout(mode_layout)
+        
+        self.plot_canvas = pg.GraphicsLayoutWidget()
+        self.plot_item = self.plot_canvas.addPlot(title="Spatial Gaussian Intensity Profile")
+        self.plot_item.showGrid(x=True, y=True, alpha=0.3)
+        self.curve = self.plot_item.plot(pen=pg.mkPen('#3aafa9', width=2))
+        
+        right_layout.addWidget(self.plot_canvas, stretch=1)
+        
+        self.btn_export = QPushButton("💾 Export Plot Data (.CSV)")
+        self.btn_export.setEnabled(False)
+        self.btn_export.clicked.connect(self.export_csv)
+        right_layout.addWidget(self.btn_export)
+        
+        splitter.addWidget(right_widget)
+        splitter.setSizes([300, 600, 600])
+
+    def browse_root_directory(self):
+        directory = QFileDialog.getExistingDirectory(self, "Select Root Experiment Directory", self.root_directory)
+        if directory:
+            self.scan_root_directory(directory)
+
+    def scan_root_directory(self, root_path):
+        self.root_directory = root_path
+        self.list_trials.clear()
+        
+        if not os.path.exists(root_path): return
+        
+        entries = [os.path.join(root_path, d) for d in os.listdir(root_path) if os.path.isdir(os.path.join(root_path, d))]
+        
+        if not entries:
+            item = QListWidgetItem(os.path.basename(root_path))
+            item.setData(Qt.ItemDataRole.UserRole, root_path)
+            self.list_trials.addItem(item)
+        else:
+            for folder in entries:
+                item = QListWidgetItem(os.path.basename(folder))
+                item.setData(Qt.ItemDataRole.UserRole, folder)
+                self.list_trials.addItem(item)
+                
+        if self.list_trials.count() > 0:
+            self.list_trials.setCurrentRow(0)
+
+    def parse_metadata(self, folder_path):
+        meta_path = os.path.join(folder_path, "experimental_metadata.txt")
+        metadata = {}
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                for line in f:
+                    if ":" in line:
+                        k, v = line.strip().split(":", 1)
+                        metadata[k.strip()] = v.strip()
+        return metadata
+
+    def display_metadata_summary(self, metadata):
+        if not metadata:
+            self.txt_metadata.setText("No metadata file found for this trial.")
+            return
+            
+        summary_text = ""
+        for k, v in metadata.items():
+            summary_text += f"<b>{k}:</b> {v}<br>"
+        self.txt_metadata.setHtml(summary_text)
+
+    def on_trial_hovered(self, item):
+        folder_path = item.data(Qt.ItemDataRole.UserRole)
+        metadata = self.parse_metadata(folder_path)
+        self.display_metadata_summary(metadata)
+
+    def on_trial_selected(self):
+        items = self.list_trials.selectedItems()
+        if not items: return
+        folder_path = items[0].data(Qt.ItemDataRole.UserRole)
+        self.load_dataset(folder_path)
+
+    def load_dataset(self, folder_path):
+        self.metadata = self.parse_metadata(folder_path)
+        self.display_metadata_summary(self.metadata)
+        
+        try:
+            self.effective_fps = float(self.metadata.get("Effective_Saved_FPS", self.metadata.get("Calculated_FPS", 87.0)))
+        except ValueError:
+            self.effective_fps = 87.0
+            
+        tifs = glob.glob(os.path.join(folder_path, "*.tif"))
+        fits_files = sorted(glob.glob(os.path.join(folder_path, "frame_*.fits")))
+        
+        try:
+            if tifs:
+                self.stack = tiff.imread(tifs[0])
+            elif fits_files:
+                frames = [fits.getdata(f) for f in fits_files]
+                self.stack = np.stack(frames, axis=0)
+            else:
+                self.lbl_trial_header.setText("Error: No TIFF or FITS file found in folder.")
+                return
+                
+            if self.stack.ndim == 2:
+                self.stack = np.expand_dims(self.stack, axis=0)
+                
+            num_frames, h, w = self.stack.shape
+            self.current_frame_idx = 0
+            
+            max_val = 65535 if self.stack.dtype == np.uint16 else 255
+            self.slider_min.setRange(0, max_val)
+            self.slider_max.setRange(0, max_val)
+            
+            self.slider_frame.setRange(0, num_frames - 1)
+            self.slider_frame.setValue(0)
+            self.slider_frame.setEnabled(num_frames > 1)
+            
+            # Position ROI over central region
+            self.roi.setPos([w//4, h//4])
+            self.roi.setSize([w//2, h//2])
+            
+            self.lbl_trial_header.setText(f"<b>Loaded:</b> {os.path.basename(folder_path)} | <b>{num_frames} frames</b> @ <b>{self.effective_fps:.1f} FPS</b>")
+            self.auto_stretch_contrast()
+            self.update_analysis_plot()
+            self.btn_export.setEnabled(True)
+            
+        except Exception as e:
+            self.lbl_trial_header.setText(f"Load Error: {str(e)}")
+
+    def auto_stretch_contrast(self):
+        if self.stack is None: return
+        frame = self.stack[self.current_frame_idx]
+        p2, p98 = np.percentile(frame, (2, 98))
+        self.slider_min.setValue(int(p2))
+        self.slider_max.setValue(int(p98))
+        self.update_image_display()
+
+    def update_image_display(self):
+        if self.stack is None: return
+        frame = self.stack[self.current_frame_idx]
+        
+        min_val = self.slider_min.value()
+        max_val = self.slider_max.value()
+        if max_val <= min_val: max_val = min_val + 1
+        
+        self.image_item.setImage(np.rot90(frame, -1), levels=(min_val, max_val))
+        
+        t_sec = self.current_frame_idx / self.effective_fps
+        self.lbl_frame_idx.setText(f"{self.current_frame_idx + 1} / {len(self.stack)} ({t_sec:.3f}s)")
+        self.update_analysis_plot()
+
+    def on_frame_slider_moved(self, val):
+        self.current_frame_idx = val
+        self.update_image_display()
+
+    def update_analysis_plot(self):
+        if self.stack is None: return
+        
+        mode = self.cmb_plot_mode.currentText()
+        roi_pos = self.roi.pos()
+        roi_size = self.roi.size()
+        
+        x = int(max(0, roi_pos.x()))
+        y = int(max(0, roi_pos.y()))
+        w = int(roi_size.x())
+        h = int(roi_size.y())
+        
+        num_frames, img_h, img_w = self.stack.shape
+        w = min(w, img_w - x)
+        h = min(h, img_h - y)
+        
+        if w <= 0 or h <= 0: return
+        
+        frame = self.stack[self.current_frame_idx]
+        roi_frame = frame[y:y+h, x:x+w]
+        
+        # --- MODE 1: SPATIAL X-AXIS PROFILE ---
+        if "X-Axis" in mode:
+            profile = np.mean(roi_frame, axis=0)  # Average along Y columns to get X profile
+            x_axis = np.arange(x, x + len(profile))
+            
+            self.plot_item.setTitle(f"Spatial X-Axis Intensity Profile (Frame {self.current_frame_idx + 1})")
+            self.plot_item.setLabel('bottom', "X Position", units='px')
+            self.plot_item.setLabel('left', "Raw Pixel Intensity")
+            self.curve.setData(x_axis, profile)
+
+        # --- MODE 2: SPATIAL Y-AXIS PROFILE ---
+        elif "Y-Axis" in mode:
+            profile = np.mean(roi_frame, axis=1)  # Average along X rows to get Y profile
+            y_axis = np.arange(y, y + len(profile))
+            
+            self.plot_item.setTitle(f"Spatial Y-Axis Intensity Profile (Frame {self.current_frame_idx + 1})")
+            self.plot_item.setLabel('bottom', "Y Position", units='px')
+            self.plot_item.setLabel('left', "Raw Pixel Intensity")
+            self.curve.setData(y_axis, profile)
+
+        # --- MODE 3: TEMPORAL Z-TRACE (KINETICS) ---
+        else:
+            roi_stack = self.stack[:, y:y+h, x:x+w]
+            mean_trace = np.mean(roi_stack, axis=(1, 2))
+            baseline = mean_trace[0] if mean_trace[0] != 0 else 1.0
+            norm_trace = mean_trace / baseline
+            
+            if num_frames == 1:
+                time_vector = np.array([0.0, 0.001])
+                norm_trace = np.array([norm_trace[0], norm_trace[0]])
+                self.plot_item.setTitle(f"Single Frame Analysis — Mean ROI Intensity: {mean_trace[0]:.2f}")
+            else:
+                time_vector = np.arange(num_frames) / self.effective_fps
+                self.plot_item.setTitle("Normalized Intensity (I / I0) vs Time")
+                
+            self.plot_item.setLabel('bottom', "Time", units='s')
+            self.plot_item.setLabel('left', "Signal (I / I0)")
+            self.curve.setData(time_vector, norm_trace)
+
+        self.plot_item.enableAutoRange(axis='y', enable=True)
+
+    def export_csv(self):
+        if self.stack is None: return
+        mode = self.cmb_plot_mode.currentText()
+        roi_pos = self.roi.pos()
+        roi_size = self.roi.size()
+        
+        x = max(0, int(roi_pos.x()))
+        y = max(0, int(roi_pos.y()))
+        w = int(roi_size.x())
+        h = int(roi_size.y())
+        
+        frame = self.stack[self.current_frame_idx]
+        roi_frame = frame[y:y+h, x:x+w]
+        
+        if "X-Axis" in mode:
+            profile = np.mean(roi_frame, axis=0)
+            df = pd.DataFrame({"X_Pixel": np.arange(x, x + len(profile)), "Intensity": profile})
+        elif "Y-Axis" in mode:
+            profile = np.mean(roi_frame, axis=1)
+            df = pd.DataFrame({"Y_Pixel": np.arange(y, y + len(profile)), "Intensity": profile})
+        else:
+            roi_stack = self.stack[:, y:y+h, x:x+w]
+            mean_trace = np.mean(roi_stack, axis=(1, 2))
+            baseline = mean_trace[0] if mean_trace[0] != 0 else 1.0
+            df = pd.DataFrame({
+                "Frame": np.arange(1, len(self.stack) + 1),
+                "Time_Sec": np.arange(len(self.stack)) / self.effective_fps,
+                "Raw_Mean_Intensity": mean_trace,
+                "Normalized_I_I0": mean_trace / baseline
+            })
+            
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save Analysis Data", "", "CSV Files (*.csv)")
+        if save_path:
+            df.to_csv(save_path, index=False)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = CappelWidefieldAnalyzer()
+    window.show()
+    sys.exit(app.exec())

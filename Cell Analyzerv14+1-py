@@ -1,0 +1,132 @@
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+def load_data_safely(filepath):
+    """Detects binary Excel headers (.xlsx) and parses file correctly."""
+    with open(filepath, "rb") as f:
+        file_header = f.read(4)
+
+    if file_header.startswith(b"PK\x03\x04"):
+        return pd.read_excel(filepath)
+
+    encodings = ["utf-8-sig", "utf-8", "cp1252", "latin1", "utf-16"]
+    for enc in encodings:
+        try:
+            df = pd.read_csv(filepath, encoding=enc)
+            if len(df.columns) > 1:
+                return df
+        except Exception:
+            continue
+
+    raise ValueError(f"Unable to parse '{filepath}'.")
+
+
+def clean_numeric_column(series):
+    """Extracts floating point numbers or integers from strings."""
+    extracted = series.astype(str).str.extract(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")[0]
+    return pd.to_numeric(extracted, errors="coerce")
+
+
+def generate_separate_plots(csv_filepath):
+    if not os.path.exists(csv_filepath):
+        print(f"Error: File not found at {csv_filepath}")
+        return
+
+    df = load_data_safely(csv_filepath)
+
+    # Clean header and metadata strings
+    df.columns = df.columns.astype(str).str.strip().str.replace("\ufeff", "")
+    for col in ["Fluorophore", "Condition"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+
+    # Extract clean numbers
+    df["Decay_Constant_k"] = clean_numeric_column(df["Decay_Constant_k"])
+    df["Wavelength"] = clean_numeric_column(df["Wavelength"])
+    df = df.dropna(subset=["Decay_Constant_k", "Wavelength"])
+
+    # Group by Wavelength, Fluorophore, Condition and compute Mean + SEM
+    stats = (
+        df.groupby(["Wavelength", "Fluorophore", "Condition"])["Decay_Constant_k"]
+        .agg(
+            mean="mean",
+            sem=lambda x: x.std() / np.sqrt(x.count()) if x.count() > 1 else 0,
+        )
+        .reset_index()
+    )
+
+    style_map = {
+        ("GFP-LaminA", "Hypoxia"): {"color": "#2d7f36", "marker": "s", "label": "LaminA [Hypoxia]"},
+        ("GFP-LaminA", "Normoxia"): {"color": "#5cb85c", "marker": "o", "label": "LaminA [Normoxia]"},
+        ("LaminA", "Hypoxia"): {"color": "#2d7f36", "marker": "s", "label": "LaminA [Hypoxia]"},
+        ("LaminA", "Normoxia"): {"color": "#5cb85c", "marker": "o", "label": "LaminA [Normoxia]"},
+        ("mCherry", "Hypoxia"): {"color": "#c0392b", "marker": "s", "label": "mCherry [Hypoxia]"},
+        ("mCherry", "Normoxia"): {"color": "#e74c3c", "marker": "o", "label": "mCherry [Normoxia]"},
+    }
+
+    output_dir = os.path.dirname(csv_filepath)
+
+    # -------------------------------------------------------------
+    # IMAGE 1: OVERALL FULL-SCALE ACTION SPECTRUM
+    # -------------------------------------------------------------
+    plt.style.use("default")
+    fig1, ax1 = plt.subplots(figsize=(9, 6), dpi=300)
+
+    for (fluor, cond), group in stats.groupby(["Fluorophore", "Condition"]):
+        group = group.sort_values("Wavelength")
+        st = style_map.get((fluor, cond), {"color": "black", "marker": "d", "label": f"{fluor} [{cond}]"})
+        ax1.errorbar(
+            group["Wavelength"], group["mean"], yerr=group["sem"],
+            label=st["label"], color=st["color"], marker=st["marker"],
+            markersize=7, linewidth=1.8, capsize=4, capthick=1.2, alpha=0.9
+        )
+
+    ax1.set_title("Unified Action Spectroscopy Decay Spectrum (Full Scale)", fontsize=12, pad=10)
+    ax1.set_xlabel("Wavelength (nm)", fontsize=11)
+    ax1.set_ylabel("Mean Decay Rate (k, frame⁻¹)", fontsize=11)
+    ax1.grid(True, linestyle=":", color="#cccccc", alpha=0.8)
+    ax1.legend(loc="upper right", frameon=True, fontsize=10)
+
+    plt.tight_layout()
+    img1_path = os.path.join(output_dir, "action_spectrum_full_overview.png")
+    plt.savefig(img1_path, dpi=300)
+    plt.close(fig1)
+    print(f"Saved full spectrum plot: {img1_path}")
+
+    # -------------------------------------------------------------
+    # IMAGE 2: HIGH-RESOLUTION ZOOMED GFP-LAMINA SPECTRUM
+    # -------------------------------------------------------------
+    fig2, ax2 = plt.subplots(figsize=(9, 6), dpi=300)
+
+    for (fluor, cond), group in stats.groupby(["Fluorophore", "Condition"]):
+        if "Lamin" in fluor or "GFP" in fluor:
+            group = group.sort_values("Wavelength")
+            st = style_map.get((fluor, cond), {"color": "#2d7f36", "marker": "s", "label": f"{fluor} [{cond}]"})
+            ax2.errorbar(
+                group["Wavelength"], group["mean"], yerr=group["sem"],
+                label=st["label"], color=st["color"], marker=st["marker"],
+                markersize=8, linewidth=2.0, capsize=5, capthick=1.5, alpha=0.95
+            )
+
+    ax2.set_title("GFP-LaminA Action Spectroscopy Decay Spectrum (Zoomed)", fontsize=12, pad=10)
+    ax2.set_xlabel("Wavelength (nm)", fontsize=11)
+    ax2.set_ylabel("Mean Decay Rate (k, frame⁻¹)", fontsize=11)
+    
+    # Restrict Y-axis scale to cleanly display low rate separation
+    ax2.set_ylim(-0.01, 0.14)
+    ax2.grid(True, linestyle=":", color="#cccccc", alpha=0.8)
+    ax2.legend(loc="upper right", frameon=True, fontsize=10)
+
+    plt.tight_layout()
+    img2_path = os.path.join(output_dir, "action_spectrum_gfp_laminA_zoomed.png")
+    plt.savefig(img2_path, dpi=300)
+    plt.close(fig2)
+    print(f"Saved GFP zoomed plot: {img2_path}")
+
+
+# --- EXECUTION ---
+csv_path = r"C:\Users\calap\OneDrive\Desktop\Data Corrected.csv"
+generate_separate_plots(csv_path)

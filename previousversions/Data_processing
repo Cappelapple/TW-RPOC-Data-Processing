@@ -1,0 +1,226 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
+from tkinter import filedialog, Tk, messagebox
+
+# ==============================================================================
+# 1. ACTUAL EXPERIMENTAL DIMENSIONS (400x400 pixels, 40 frames)
+# ==============================================================================
+X_PIXELS = 400
+Y_PIXELS = 400
+NUM_FRAMES = 40
+
+# ==============================================================================
+# 2. ROBUST TEXT DECODING ENGINE
+# ==============================================================================
+def reconstruct_channel_stack(file_path, is_mask=False):
+    """
+    Reads the text file completely as a raw string to avoid delimiter/row bugs,
+    extracts every floating-point number, and shapes it into a proper 2D/3D array.
+    """
+    print(f"Reading file: {os.path.basename(file_path)}...")
+    
+    with open(file_path, 'r') as f:
+        content = f.read()
+        
+    # Use regular expressions to find ALL numbers (including scientific notation like 1.23E-4)
+    # This completely eliminates issues with mismatched spaces, tabs, or commas.
+    numbers = re.findall(r'[-+]?\d*\.\d+|\d+', content)
+    raw_data = np.array(numbers, dtype=np.float64)
+    
+    if raw_data.size == 0:
+        raise ValueError(f"The file '{os.path.basename(file_path)}' did not contain parseable numerical data.")
+        
+    total_points = len(raw_data)
+    points_per_frame = Y_PIXELS * X_PIXELS # 160,000 points
+    
+    # Handle the single-frame Mask layout (160,000 points)
+    if is_mask:
+        # If the mask file accidentally contains trailing frames, just grab the first 160,000 points
+        print(f"-> Successfully parsed mask ({total_points} total numerical elements found).")
+        return raw_data[:points_per_frame].reshape((1, Y_PIXELS, X_PIXELS))
+        
+    # Handle standard multi-frame data stack (Expected: 6,400,000 points)
+    dynamic_frames = int(total_points / points_per_frame)
+    print(f"-> Successfully parsed data stack ({dynamic_frames} frames, {total_points} elements found).")
+    
+    if dynamic_frames == 0:
+        raise ValueError(f"File '{os.path.basename(file_path)}' only has {total_points} points, which can't fill a full 2D frame.")
+        
+    return raw_data[:dynamic_frames * points_per_frame].reshape((dynamic_frames, Y_PIXELS, X_PIXELS))
+
+# ==============================================================================
+# 3. INTERACTIVE CELL ANALYZER SELECTION APP
+# ==============================================================================
+class CellAnalyzerGUI:
+    def __init__(self):
+        self.gfp_stack = None
+        self.mcherry_stack = None
+        self.mask_frame = None
+        self.dataset_name = "Experiment"
+        
+        # Click storage arrays (X, Y pixel coordinates)
+        self.treated_coords = []
+        self.control_coords = []
+        self.background_coords = []
+        
+        self.current_phase = "TREATED" # TREATED -> CONTROL -> BACKGROUND -> DONE
+        
+    def run_pipeline(self):
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        
+        messagebox.showinfo("File Loader", "Step 1: Select your GFP Data Channel file (.txt)")
+        gfp_path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
+        if not gfp_path: return
+        
+        self.dataset_name = os.path.basename(gfp_path).split('_')[0]
+        
+        messagebox.showinfo("File Loader", "Step 2: Select your mCherry Data Channel file (.txt)")
+        mcherry_path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
+        if not mcherry_path: return
+        
+        messagebox.showinfo("File Loader", "Step 3: Select your Mask file (.txt)")
+        mask_path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
+        if not mask_path: return
+        
+        print("\nExtracting and reconstructing 2D spatial data arrays...")
+        self.gfp_stack = reconstruct_channel_stack(gfp_path, is_mask=False)
+        self.mcherry_stack = reconstruct_channel_stack(mcherry_path, is_mask=False)
+        
+        mask_stack = reconstruct_channel_stack(mask_path, is_mask=True)
+        self.mask_frame = mask_stack[0] # Grab the single 400x400 spatial frame
+            
+        self.launch_selection_window()
+
+    def launch_selection_window(self):
+        self.fig, self.ax = plt.subplots(figsize=(8, 8))
+        plt.subplots_adjust(bottom=0.2)
+        
+        # Plot Frame 1 of GFP as the 2D image backdrop
+        self.ax.imshow(self.gfp_stack[0], cmap='gray')
+        
+        # Overlay the mask text file lightly in transparent red
+        display_mask = np.where(self.mask_frame > (np.max(self.mask_frame) * 0.1), 1, 0)
+        self.ax.imshow(display_mask, cmap='Reds', alpha=0.25)
+        
+        self.update_title()
+        
+        self.cid = self.fig.canvas.mpl_connect('button_press_event', self.on_click)
+        
+        ax_btn = plt.axes([0.4, 0.05, 0.2, 0.065])
+        self.btn_submit = Button(ax_btn, 'Process Data', color='lightgreen', hovercolor='green')
+        self.btn_submit.on_clicked(self.process_selected_data)
+        
+        plt.show()
+
+    def update_title(self):
+        if self.current_phase == "TREATED":
+            self.ax.set_title(f"Click up to 5 TREATED cells ({len(self.treated_coords)}/5 clicked)")
+        elif self.current_phase == "CONTROL":
+            self.ax.set_title(f"Click up to 2 CONTROL cells ({len(self.control_coords)}/2 clicked)")
+        elif self.current_phase == "BACKGROUND":
+            self.ax.set_title(f"Click 1 background/empty spot ({len(self.background_coords)}/1 clicked)")
+        elif self.current_phase == "DONE":
+            self.ax.set_title("Selection complete! Click the 'Process Data' button below.")
+        self.fig.canvas.draw()
+
+    def on_click(self, event):
+        if event.inaxes != self.ax:
+            return
+            
+        x, y = int(round(event.xdata)), int(round(event.ydata))
+        
+        if self.current_phase == "TREATED" and len(self.treated_coords) < 5:
+            self.treated_coords.append((x, y))
+            self.ax.plot(x, y, 'ro', markersize=8) # Red dot
+                
+        elif self.current_phase == "CONTROL" and len(self.control_coords) < 2:
+            self.control_coords.append((x, y))
+            self.ax.plot(x, y, 'bo', markersize=8) # Blue dot
+                
+        elif self.current_phase == "BACKGROUND" and len(self.background_coords) < 1:
+            self.background_coords.append((x, y))
+            self.ax.plot(x, y, 'co', markersize=8) # Cyan dot
+            
+        if len(self.treated_coords) == 5 and self.current_phase == "TREATED":
+            self.current_phase = "CONTROL"
+        elif len(self.control_coords) == 2 and self.current_phase == "CONTROL":
+            self.current_phase = "BACKGROUND"
+        elif len(self.background_coords) == 1 and self.current_phase == "BACKGROUND":
+            self.current_phase = "DONE"
+            
+        self.update_title()
+
+    def process_selected_data(self, event):
+        if not self.background_coords:
+            messagebox.showwarning("Warning", "Please complete all selections first!")
+            return
+            
+        self.fig.canvas.mpl_disconnect(self.cid)
+        plt.close(self.fig)
+        
+        print("\nCalculating background-subtracted F/F0 kinetics...")
+        
+        def get_pixel_intensity_over_time(stack, coords_list):
+            intensities_per_frame = []
+            for frame in stack:
+                frame_vals = []
+                for (x, y) in coords_list:
+                    # 3x3 pixel box neighborhood to smooth out local noise
+                    y_min, y_max = max(0, y-1), min(Y_PIXELS, y+2)
+                    x_min, x_max = max(0, x-1), min(X_PIXELS, x+2)
+                    frame_vals.append(np.mean(frame[y_min:y_max, x_min:x_max]))
+                intensities_per_frame.append(np.mean(frame_vals))
+            return np.array(intensities_per_frame)
+            
+        gfp_treated_raw = get_pixel_intensity_over_time(self.gfp_stack, self.treated_coords)
+        gfp_control_raw = get_pixel_intensity_over_time(self.gfp_stack, self.control_coords)
+        gfp_bg_raw = get_pixel_intensity_over_time(self.gfp_stack, self.background_coords)
+        
+        mcherry_treated_raw = get_pixel_intensity_over_time(self.mcherry_stack, self.treated_coords)
+        mcherry_control_raw = get_pixel_intensity_over_time(self.mcherry_stack, self.control_coords)
+        mcherry_bg_raw = get_pixel_intensity_over_time(self.mcherry_stack, self.background_coords)
+        
+        # Apply background-subtracted flatfield correction: (F(t) - BG) / (F0 - BG)
+        gfp_t_corr = (gfp_treated_raw - gfp_bg_raw) / (gfp_treated_raw[0] - gfp_bg_raw[0])
+        gfp_c_corr = (gfp_control_raw - gfp_bg_raw) / (gfp_control_raw[0] - gfp_bg_raw[0])
+        
+        mcherry_t_corr = (mcherry_treated_raw - mcherry_bg_raw) / (mcherry_treated_raw[0] - mcherry_bg_raw[0])
+        mcherry_c_corr = (mcherry_control_raw - mcherry_bg_raw) / (mcherry_control_raw[0] - mcherry_bg_raw[0])
+        
+        df = pd.DataFrame({
+            'Frame': np.arange(1, NUM_FRAMES + 1),
+            'GFP_Treated_Fixed': gfp_t_corr,
+            'GFP_Control_Fixed': gfp_c_corr,
+            'mCherry_Treated_Fixed': mcherry_t_corr,
+            'mCherry_Control_Fixed': mcherry_c_corr
+        })
+        
+        csv_filename = f"{self.dataset_name}_2D_cell_kinetics.csv"
+        df.to_csv(csv_filename, index=False)
+        print(f"Data successfully saved to {csv_filename}")
+        
+        # Plot final ratiometric curves
+        plt.figure(figsize=(10, 6))
+        plt.plot(df['Frame'], df['GFP_Treated_Fixed'], 'g-o', linewidth=2, label='GFP - Selected Treated Cells')
+        plt.plot(df['Frame'], df['GFP_Control_Fixed'], 'g--x', linewidth=1.5, label='GFP - Selected Control Cells')
+        plt.plot(df['Frame'], df['mCherry_Treated_Fixed'], 'r-o', linewidth=2, label='mCherry - Selected Treated Cells')
+        plt.plot(df['Frame'], df['mCherry_Control_Fixed'], 'r--x', linewidth=1.5, label='mCherry - Selected Control Cells')
+        
+        plt.title(f"Normalized Dye Kinetics (F / F_0) | {self.dataset_name}", fontsize=12)
+        plt.xlabel("Frame Number", fontsize=10)
+        plt.ylabel("Corrected Response", fontsize=10)
+        plt.legend(loc='best')
+        plt.grid(True, linestyle=':', alpha=0.6)
+        
+        plt.savefig(f"{self.dataset_name}_fixed_2D_decay_plot.png", dpi=300)
+        plt.show()
+
+if __name__ == "__main__":
+    analyzer = CellAnalyzerGUI()
+    analyzer.run_pipeline()

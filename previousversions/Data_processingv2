@@ -1,0 +1,237 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button, EllipseSelector
+from tkinter import filedialog, Tk, messagebox
+
+# ==============================================================================
+# 1. ACTUAL EXPERIMENTAL DIMENSIONS
+# ==============================================================================
+X_PIXELS = 400
+Y_PIXELS = 400
+NUM_FRAMES = 40
+
+# ==============================================================================
+# 2. ROBUST TEXT DECODING ENGINE
+# ==============================================================================
+def reconstruct_channel_stack(file_path, is_mask=False):
+    print(f"Reading file: {os.path.basename(file_path)}...")
+    with open(file_path, 'r') as f:
+        content = f.read()
+    numbers = re.findall(r'[-+]?\d*\.\d+|\d+', content)
+    raw_data = np.array(numbers, dtype=np.float64)
+    
+    if raw_data.size == 0:
+        raise ValueError(f"The file '{os.path.basename(file_path)}' did not contain numerical data.")
+        
+    points_per_frame = Y_PIXELS * X_PIXELS
+    if is_mask:
+        return raw_data[:points_per_frame].reshape((1, Y_PIXELS, X_PIXELS))
+        
+    dynamic_frames = int(len(raw_data) / points_per_frame)
+    print(f"-> Successfully parsed stack ({dynamic_frames} frames).")
+    return raw_data[:dynamic_frames * points_per_frame].reshape((dynamic_frames, Y_PIXELS, X_PIXELS))
+
+# ==============================================================================
+# 3. INTERACTIVE CIRCLE-ROI SELECTION APP
+# ==============================================================================
+class DynamicCellAnalyzer:
+    def __init__(self):
+        self.gfp_stack = None
+        self.mcherry_stack = None
+        self.mask_frame = None
+        self.dataset_name = "Experiment"
+        
+        # Lists to store the masks of the drawn circles
+        self.treated_masks = []
+        self.control_masks = []
+        self.background_masks = []
+        
+        self.current_phase = "TREATED"  # TREATED -> CONTROL -> BACKGROUND -> DONE
+        self.selectors = []  # Keep references to selectors so they stay active
+        
+    def run_pipeline(self):
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        
+        gfp_path = filedialog.askopenfilename(title="Select GFP Data Channel (.txt)", filetypes=[("Text files", "*.txt")])
+        if not gfp_path: return
+        self.dataset_name = os.path.basename(gfp_path).split('_')[0]
+        
+        mcherry_path = filedialog.askopenfilename(title="Select mCherry Data Channel (.txt)", filetypes=[("Text files", "*.txt")])
+        if not mcherry_path: return
+        
+        mask_path = filedialog.askopenfilename(title="Select Mask file (.txt)", filetypes=[("Text files", "*.txt")])
+        if not mask_path: return
+        
+        print("\nExtracting and reconstructing 2D spatial data arrays...")
+        self.gfp_stack = reconstruct_channel_stack(gfp_path, is_mask=False)
+        self.mcherry_stack = reconstruct_channel_stack(mcherry_path, is_mask=False)
+        self.mask_frame = reconstruct_channel_stack(mask_path, is_mask=True)[0]
+            
+        self.launch_selection_window()
+
+    def launch_selection_window(self):
+        self.fig, self.ax = plt.subplots(figsize=(9, 9))
+        plt.subplots_adjust(bottom=0.25)
+        
+        # Display baseline frame
+        self.ax.imshow(self.gfp_stack[0], cmap='gray')
+        display_mask = np.where(self.mask_frame > (np.max(self.mask_frame) * 0.1), 1, 0)
+        self.ax.imshow(display_mask, cmap='Reds', alpha=0.2)
+        
+        self.update_title()
+        
+        # Set up the click-and-drag ellipse/circle selector tool
+        # Set up the click-and-drag ellipse/circle selector tool
+        self.ellipse_selector = EllipseSelector(
+            self.ax, self.on_ellipse_select,
+            useblit=True, button=[1], 
+            minspanx=2, minspany=2,
+            interactive=True
+        )
+        
+        # Add a "Next Phase" button to change cell types dynamically
+        ax_next = plt.axes([0.2, 0.05, 0.2, 0.06])
+        self.btn_next = Button(ax_next, 'Next Phase (Type)', color='lightblue', hovercolor='cyan')
+        self.btn_next.on_clicked(self.advance_phase)
+        
+        # Add a "Process" button
+        ax_proc = plt.axes([0.6, 0.05, 0.2, 0.06])
+        self.btn_submit = Button(ax_proc, 'Process Data', color='lightgreen', hovercolor='green')
+        self.btn_submit.on_clicked(self.process_selected_data)
+        
+        # Also let users press 'n' on the keyboard to advance phases quickly
+        self.fig.canvas.mpl_connect('key_press_event', self.on_key)
+        
+        plt.show()
+
+    def update_title(self):
+        msg = f"PHASE: {self.current_phase}\n"
+        if self.current_phase == "TREATED":
+            msg += f"-> Click & drag circles around TREATED cells (Drawn: {len(self.treated_masks)})\nPress 'Next Phase' or key 'n' when finished."
+        elif self.current_phase == "CONTROL":
+            msg += f"-> Click & drag circles around CONTROL cells (Drawn: {len(self.control_masks)})\nPress 'Next Phase' or key 'n' when finished."
+        elif self.current_phase == "BACKGROUND":
+            msg += f"-> Click & drag a circle over empty BACKGROUND (Drawn: {len(self.background_masks)})"
+        elif self.current_phase == "DONE":
+            msg += "Selection complete! Click the green 'Process Data' button."
+        self.ax.set_title(msg, fontsize=10, loc='left')
+        self.fig.canvas.draw_idle()
+
+    def on_ellipse_select(self, eclick, erelease):
+        """Triggered whenever a circle/ellipse selection is completed."""
+        # Get extent coordinates of the drawn box
+        extents = self.ellipse_selector.extents  # [xmin, xmax, ymin, ymax]
+        
+        # Generate a pixel mask grid of the image
+        y_indices, x_indices = np.ogrid[:Y_PIXELS, :X_PIXELS]
+        
+        # Calculate center and radii of the drawn circle
+        cx = (extents[0] + extents[1]) / 2
+        cy = (extents[2] + extents[3]) / 2
+        rx = (extents[1] - extents[0]) / 2
+        ry = (extents[3] - extents[2]) / 2
+        
+        # Avoid zero radius division errors
+       # Clean, bug-free fix
+        if rx == 0 or ry == 0: 
+            return
+        
+        # Mathematical formula for inside an ellipse/circle
+        pixel_mask = ((x_indices - cx)**2 / rx**2 + (y_indices - cy)**2 / ry**2) <= 1
+        
+        # Color coding for the visual circle outlines on screen
+        color = 'r' if self.current_phase == "TREATED" else 'b' if self.current_phase == "CONTROL" else 'c'
+        
+        # Draw a permanent visual patch circle outline on the plot
+        patch = plt.matplotlib.patches.Ellipse((cx, cy), rx*2, ry*2, edgecolor=color, facecolor='none', linewidth=2, linestyle='-')
+        self.ax.add_patch(patch)
+        
+        # Store the pixel mask group based on current phase
+        if self.current_phase == "TREATED":
+            self.treated_masks.append(pixel_mask)
+        elif self.current_phase == "CONTROL":
+            self.control_masks.append(pixel_mask)
+        elif self.current_phase == "BACKGROUND":
+            self.background_masks.append(pixel_mask)
+            
+        self.update_title()
+
+    def advance_phase(self, event=None):
+        if self.current_phase == "TREATED":
+            self.current_phase = "CONTROL"
+        elif self.current_phase == "CONTROL":
+            self.current_phase = "BACKGROUND"
+        elif self.current_phase == "BACKGROUND":
+            self.current_phase = "DONE"
+        self.update_title()
+
+    def on_key(self, event):
+        if event.key == 'n':
+            self.advance_phase()
+
+    def process_selected_data(self, event):
+        if not self.background_masks or not self.treated_masks:
+            messagebox.showwarning("Warning", "You must select at least one Treated zone and a Background baseline!")
+            return
+            
+        plt.close(self.fig)
+        print("\nCalculating spatial circle averages and kinetics...")
+        
+        def get_mask_list_intensity_over_time(stack, masks_list):
+            intensities = []
+            for frame in stack:
+                frame_vals = []
+                for mask in masks_list:
+                    # Extract every single pixel within the circle mask and take the average
+                    frame_vals.append(np.mean(frame[mask]))
+                intensities.append(np.mean(frame_vals))
+            return np.array(intensities)
+            
+        # 1. Aggregate spatial data inside the drawn circles
+        gfp_treated_raw = get_mask_list_intensity_over_time(self.gfp_stack, self.treated_masks)
+        gfp_control_raw = get_mask_list_intensity_over_time(self.gfp_stack, self.control_masks) if self.control_masks else np.ones(NUM_FRAMES)
+        gfp_bg_raw = get_mask_list_intensity_over_time(self.gfp_stack, self.background_masks)
+        
+        mcherry_treated_raw = get_mask_list_intensity_over_time(self.mcherry_stack, self.treated_masks)
+        mcherry_control_raw = get_mask_list_intensity_over_time(self.mcherry_stack, self.control_masks) if self.control_masks else np.ones(NUM_FRAMES)
+        mcherry_bg_raw = get_mask_list_intensity_over_time(self.mcherry_stack, self.background_masks)
+        
+        # 2. Background subtraction and F/F0 pixel group normalization
+        gfp_t_corr = (gfp_treated_raw - gfp_bg_raw) / (gfp_treated_raw[0] - gfp_bg_raw[0])
+        gfp_c_corr = (gfp_control_raw - gfp_bg_raw) / (gfp_control_raw[0] - gfp_bg_raw[0]) if self.control_masks else np.ones(NUM_FRAMES)
+        
+        mcherry_t_corr = (mcherry_treated_raw - mcherry_bg_raw) / (mcherry_treated_raw[0] - mcherry_bg_raw[0])
+        mcherry_c_corr = (mcherry_control_raw - mcherry_bg_raw) / (mcherry_control_raw[0] - mcherry_bg_raw[0]) if self.control_masks else np.ones(NUM_FRAMES)
+        
+        # 3. Export Data
+        df = pd.DataFrame({'Frame': np.arange(1, NUM_FRAMES + 1), 'GFP_Treated_Fixed': gfp_t_corr, 'GFP_Control_Fixed': gfp_c_corr, 'mCherry_Treated_Fixed': mcherry_t_corr, 'mCherry_Control_Fixed': mcherry_c_corr})
+        csv_filename = f"{self.dataset_name}_circle_ROI_kinetics.csv"
+        df.to_csv(csv_filename, index=False)
+        print(f"Data successfully saved to {csv_filename}")
+        
+        # 4. Final Graph Plot
+        plt.figure(figsize=(10, 6))
+        plt.plot(df['Frame'], df['GFP_Treated_Fixed'], 'g-o', linewidth=2, label='GFP - Treated (Averaged Circles)')
+        if self.control_masks: plt.plot(df['Frame'], df['GFP_Control_Fixed'], 'g--x', linewidth=1.5, label='GFP - Control')
+        plt.plot(df['Frame'], df['mCherry_Treated_Fixed'], 'r-o', linewidth=2, label='mCherry - Treated (Averaged Circles)')
+        if self.control_masks: plt.plot(df['Frame'], df['mCherry_Control_Fixed'], 'r--x', linewidth=1.5, label='mCherry - Control')
+        
+        plt.title(f"Averaged Circle ROI Kinetics Plot (F / F_0) | {self.dataset_name}", fontsize=12)
+        plt.xlabel("Frame Number")
+        plt.ylabel("Corrected Ratiometric Response")
+        plt.legend(loc='best')
+        plt.grid(True, linestyle=':', alpha=0.6)
+        plt.savefig(f"{self.dataset_name}_circle_decay_plot.png", dpi=300)
+        plt.show()
+
+if __name__ == "__main__":
+    import matplotlib
+    try: matplotlib.use('Qt5Agg')
+    except: matplotlib.use('TkAgg')
+    analyzer = DynamicCellAnalyzer()
+    analyzer.run_pipeline()

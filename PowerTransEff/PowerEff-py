@@ -1,0 +1,235 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.interpolate import interp1d
+
+# ==============================================================================
+# 1. Calibration Dataset
+# ==============================================================================
+data = [
+    (725, 24.5, 80.0),
+    (730, 85.5, 260.0),
+    (750, 143.0, 356.0),
+    (775, 157.0, 350.0),
+    (800, 115.0, 250.0),
+    (825, 156.0, 319.0),
+    (850, 181.0, 345.0),
+    (875, 175.0, 334.0),
+    (900, 165.0, 322.0),
+    (925, 148.0, 292.0),
+    (950, 131.0, 271.0),
+    (975, 111.0, 246.0),
+    (1000, 89.0, 225.0),
+]
+
+df_cal = pd.DataFrame(
+    data, columns=['Wavelength_nm', 'Sample_Power_mW', 'Ref_Power_mW']
+)
+transmission = df_cal['Sample_Power_mW'] / df_cal['Ref_Power_mW']
+get_transmission = interp1d(
+    df_cal['Wavelength_nm'],
+    transmission,
+    kind='cubic',
+    fill_value='extrapolate',
+)
+
+target_powers = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+
+# ==============================================================================
+# 2. Build and Export CSV Table
+# ==============================================================================
+rows = []
+for idx, r in df_cal.iterrows():
+  wl = int(r['Wavelength_nm'])
+  t = r['Sample_Power_mW'] / r['Ref_Power_mW']
+  ev_1p = 1239.842 / wl
+  ev_2p = 2 * ev_1p
+  wn_laser = 1e7 / wl
+  wn_2pe = 2 * wn_laser
+
+  row_dict = {
+      'Wavelength (nm)': wl,
+      'Transmission (%)': round(t * 100, 2),
+      '1P Energy (eV)': round(ev_1p, 3),
+      '2PE Energy (eV)': round(ev_2p, 3),
+      '1P Wavenumber (cm-1)': int(round(wn_laser)),
+      '2PE Wavenumber (cm-1)': int(round(wn_2pe)),
+  }
+  for p in target_powers:
+    row_dict[f'Ref_Pwr_{p}mW_target'] = round(p / t, 1) if t > 0 else 0.0
+  rows.append(row_dict)
+
+export_df = pd.DataFrame(rows)
+export_df.to_csv('power_calibration_reference_table.csv', index=False)
+
+# ==============================================================================
+# 3. Plot 1: Optical Transmission Curve
+# ==============================================================================
+wl_fine = np.linspace(725, 1000, 300)
+ev_fine = 1239.842 / wl_fine
+trans_fine = get_transmission(wl_fine) * 100
+
+plt.figure(figsize=(7, 4.8), dpi=300)
+plt.plot(
+    df_cal['Wavelength_nm'],
+    transmission * 100,
+    'ro',
+    label='Measured Calibration Points',
+    zorder=4,
+)
+plt.plot(
+    wl_fine, trans_fine, 'b-', linewidth=2, label=r'Cubic Spline $T(\lambda)$'
+)
+
+plt.title(
+    'Optical Transmission vs. Wavelength',
+    fontsize=12,
+    fontweight='bold',
+    pad=12,
+)
+plt.xlabel('Wavelength (nm)', fontsize=11)
+plt.ylabel('Transmission to Sample (%)', fontsize=11)
+plt.xlim(720, 1005)
+plt.ylim(25, 60)
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.legend(frameon=True, fontsize=9.5)
+
+secax1 = plt.gca().secondary_xaxis(
+    'top',
+    functions=(
+        lambda wl: 1239.842 / np.maximum(wl, 1e-5),
+        lambda ev: 1239.842 / np.maximum(ev, 1e-5),
+    ),
+)
+secax1.set_xlabel('Single-Photon Energy (eV)', fontsize=10, labelpad=7)
+
+plt.tight_layout()
+plt.savefig('01_transmission_curve.png', dpi=300)
+plt.close()
+
+# ==============================================================================
+# 4. Plot 2: 2PE Transition Energy & Wavenumbers
+# ==============================================================================
+fig, ax2 = plt.subplots(figsize=(7, 4.8), dpi=300)
+
+ax2.plot(
+    wl_fine,
+    ev_fine,
+    color='purple',
+    linewidth=2,
+    label=r'1-Photon Energy ($h\nu$)',
+)
+ax2.plot(
+    wl_fine,
+    2 * ev_fine,
+    color='crimson',
+    linestyle='--',
+    linewidth=2,
+    label=r'2-Photon Transition Energy ($2h\nu$)',
+)
+
+ax2.set_title(
+    '2PE Excitation Energy & Wavenumber vs. Wavelength',
+    fontsize=12,
+    fontweight='bold',
+    pad=12,
+)
+ax2.set_xlabel('Laser Wavelength (nm)', fontsize=11)
+ax2.set_ylabel('Energy (eV)', fontsize=11)
+ax2.set_xlim(720, 1005)
+ax2.grid(True, linestyle='--', alpha=0.5)
+ax2.legend(frameon=True, fontsize=9.5)
+
+ax2_twin = ax2.twinx()
+ax2_twin.set_ylim(2 * 1e7 / 1005, 2 * 1e7 / 720)
+ax2_twin.set_ylabel(
+    '2PE Transition Wavenumber ($\mathrm{cm}^{-1}$)', color='teal', fontsize=10
+)
+ax2_twin.tick_params(axis='y', labelcolor='teal')
+
+plt.tight_layout()
+plt.savefig('02_energy_and_wavenumber.png', dpi=300)
+plt.close()
+
+# ==============================================================================
+# 5. Plot 3: Required Reference Power Curves
+# ==============================================================================
+plt.figure(figsize=(8, 5.2), dpi=300)
+colors = plt.cm.turbo(np.linspace(0.1, 0.95, len(target_powers[1:])))
+
+for p, color in zip(target_powers[1:], colors):
+  plt.plot(
+      wl_fine,
+      p / (trans_fine / 100),
+      label=f'{p} mW Target',
+      color=color,
+      linewidth=1.8,
+  )
+
+plt.title(
+    'Required Reference Power vs. Wavelength',
+    fontsize=12,
+    fontweight='bold',
+    pad=12,
+)
+plt.xlabel('Wavelength (nm)', fontsize=11)
+plt.ylabel('Reference Power to Set (mW)', fontsize=11)
+plt.xlim(720, 1005)
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.legend(
+    bbox_to_anchor=(1.04, 1), loc='upper left', frameon=True, fontsize=8.5
+)
+
+plt.tight_layout()
+plt.savefig('03_required_ref_power_curves.png', dpi=300)
+plt.close()
+
+# ==============================================================================
+# 6. Plot 4: Look-Up Table Graphic
+# ==============================================================================
+fig_cols = ['λ (nm)', 'T(λ) (%)', '2PE (eV)', '2PE (cm⁻¹)'] + [
+    f'{p} mW' for p in target_powers
+]
+fig_rows = []
+
+for idx, r in export_df.iterrows():
+  row_vals = [
+      str(int(r['Wavelength (nm)'])),
+      f"{r['Transmission (%)']:.1f}%",
+      f"{r['2PE Energy (eV)']:.2f}",
+      f"{int(r['2PE Wavenumber (cm-1)']):,}",
+  ] + [f"{r[f'Ref_Pwr_{p}mW_target']:.1f}" for p in target_powers]
+  fig_rows.append(row_vals)
+
+fig, ax = plt.subplots(figsize=(16, 6), dpi=300)
+ax.axis('tight')
+ax.axis('off')
+
+table = ax.table(
+    cellText=fig_rows, colLabels=fig_cols, loc='center', cellLoc='center'
+)
+table.auto_set_font_size(False)
+table.set_fontsize(9)
+table.scale(1.0, 1.6)
+
+for col_idx in range(len(fig_cols)):
+  cell = table[(0, col_idx)]
+  cell.set_facecolor('#1e293b')
+  cell.set_text_props(color='white', weight='bold')
+
+for row_idx in range(1, len(fig_rows) + 1):
+  bg_color = '#f8fafc' if row_idx % 2 == 0 else '#ffffff'
+  for col_idx in range(len(fig_cols)):
+    cell = table[(row_idx, col_idx)]
+    cell.set_facecolor(bg_color)
+    if col_idx < 4:
+      cell.set_text_props(weight='semibold')
+
+plt.title(
+    'Lookup Table: Required Reference Power vs Target Sample Power',
+    fontsize=13,
+    weight='bold',
+    pad=18,
+)
+plt.savefig('04_calibration_lookup_table.png', bbox_inches='tight', dpi=300)
+plt.close()

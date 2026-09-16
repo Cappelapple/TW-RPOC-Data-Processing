@@ -1,0 +1,259 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.widgets import LassoSelector
+from matplotlib.path import Path
+from matplotlib.patches import Polygon
+from tkinter import filedialog, Tk, messagebox
+from scipy.optimize import curve_fit
+
+# ==============================================================================
+# 1. FIXED EXPERIMENTAL DIMENSIONS
+# ==============================================================================
+X_PIXELS = 400
+Y_PIXELS = 400
+NUM_FRAMES = 40
+FRAME_TIME_STEP = 1.0  
+
+# ==============================================================================
+# 2. MATHEMATICAL DECAY FIT FUNCTION
+# ==============================================================================
+def exponential_decay(t, A, k, C):
+    return A * np.exp(-k * t) + C
+
+def fit_decay_constant(time_axis, intensity_profile):
+    try:
+        p0 = [intensity_profile[0] - intensity_profile[-1], 0.1, intensity_profile[-1]]
+        bounds = ([0, 0, 0], [2.0, 5.0, 1.5])
+        popt, _ = curve_fit(exponential_decay, time_axis, intensity_profile, p0=p0, bounds=bounds, maxfev=5000)
+        return popt[1]  
+    except Exception as e:
+        return np.nan
+
+# ==============================================================================
+# 3. ROBUST TEXT DECODING ENGINE
+# ==============================================================================
+def reconstruct_channel_stack(file_path, is_mask=False):
+    with open(file_path, 'r') as f:
+        content = f.read()
+    numbers = re.findall(r'[-+]?\d*\.\d+|\d+', content)
+    raw_data = np.array(numbers, dtype=np.float64)
+    
+    if raw_data.size == 0:
+        raise ValueError(f"The file '{os.path.basename(file_path)}' did not contain numerical data.")
+        
+    points_per_frame = Y_PIXELS * X_PIXELS
+    if is_mask:
+        return raw_data[:points_per_frame].reshape((1, Y_PIXELS, X_PIXELS))
+        
+    dynamic_frames = int(len(raw_data) / points_per_frame)
+    return raw_data[:dynamic_frames * points_per_frame].reshape((dynamic_frames, Y_PIXELS, X_PIXELS))
+
+# ==============================================================================
+# 4. UNIFIED FREEHAND TRACER + FITTER (KEYBOARD CONTROLLED)
+# ==============================================================================
+class KeyboardCellAnalyzer:
+    def __init__(self):
+        self.gfp_stack = None
+        self.mcherry_stack = None
+        self.mask_frame = None
+        self.dataset_name = "Experiment"
+        
+        self.wavelength = "Unknown"
+        self.condition = "Unknown"
+        
+        self.masks = {"TREATED": [], "CONTROL": [], "BACKGROUND": []}
+        self.patches = {"TREATED": [], "CONTROL": [], "BACKGROUND": []}
+        self.current_phase = "TREATED"
+        
+    def run_pipeline(self):
+        root = Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        
+        gfp_path = filedialog.askopenfilename(title="Select GFP Data Channel (.txt)", filetypes=[("Text files", "*.txt")])
+        if not gfp_path: return
+        
+        filename = os.path.basename(gfp_path)
+        self.dataset_name = filename.split('_')[0]
+        
+        wave_match = re.search(r'(\d+nm)', filename, re.IGNORECASE)
+        if re.search(r'norm', filename, re.IGNORECASE):
+            self.condition = "Normoxia"
+        elif re.search(r'hypo', filename, re.IGNORECASE):
+            self.condition = "Hypoxia"
+        else:
+            self.condition = "Unknown"
+        self.wavelength = wave_match.group(1) if wave_match else "Unknown"
+        
+        mcherry_path = filedialog.askopenfilename(title="Select mCherry Data Channel (.txt)", filetypes=[("Text files", "*.txt")])
+        if not mcherry_path: return
+        
+        mask_path = filedialog.askopenfilename(title="Select Mask file (.txt)", filetypes=[("Text files", "*.txt")])
+        if not mask_path: return
+        
+        print(f"\nProcessing {self.wavelength} under {self.condition} condition...")
+        self.gfp_stack = reconstruct_channel_stack(gfp_path, is_mask=False)
+        self.mcherry_stack = reconstruct_channel_stack(mcherry_path, is_mask=False)
+        self.mask_frame = reconstruct_channel_stack(mask_path, is_mask=True)[0]
+            
+        self.launch_selection_window()
+
+    def launch_selection_window(self):
+        self.fig, self.ax = plt.subplots(figsize=(9, 9))
+        # Remove massive bottom padding since buttons are gone
+        plt.subplots_adjust(bottom=0.1)
+        
+        self.ax.imshow(self.gfp_stack[0], cmap='gray')
+        display_mask = np.where(self.mask_frame > (np.max(self.mask_frame) * 0.1), 1, 0)
+        self.ax.imshow(display_mask, cmap='Reds', alpha=0.2)
+        
+        self.update_title()
+        
+        # Initialize LassoSelector
+        self.lasso = LassoSelector(self.ax, self.on_lasso_select, props=dict(color='yellow', linewidth=1.5))
+        
+        # Link keyboard triggers to the canvas window
+        self.fig.canvas.mpl_connect('key_press_event', self.on_key)
+        plt.show()
+
+    def update_title(self):
+        msg = (f"DATASET: {self.dataset_name} | {self.wavelength} [{self.condition}]\n"
+               f"PHASE: {self.current_phase}\n"
+               f"-----------------------------------------------------------------------\n")
+        if self.current_phase == "TREATED":
+            msg += f"[Action] Click & drag to trace TREATED cells (Count: {len(self.masks['TREATED'])})\n[Control] Press 'n' on keyboard when finished with this type."
+        elif self.current_phase == "CONTROL":
+            msg += f"[Action] Click & drag to trace CONTROL cells (Count: {len(self.masks['CONTROL'])})\n[Control] Press 'n' on keyboard when finished with this type."
+        elif self.current_phase == "BACKGROUND":
+            msg += f"[Action] Trace empty BACKGROUND region (Count: {len(self.masks['BACKGROUND'])})\n[Control] Press 'n' to lock selection."
+        elif self.current_phase == "DONE":
+            msg += "[READY] All areas captured! Press 'Enter' to process data & fit curves.\n[Control] Press 'z' if you need to step back and fix anything."
+            
+        self.ax.set_title(msg, fontsize=10, loc='left', family='monospace')
+        self.fig.canvas.draw_idle()
+
+    def on_lasso_select(self, verts):
+        if len(verts) < 3 or self.current_phase == "DONE": return
+        color = 'r' if self.current_phase == "TREATED" else 'b' if self.current_phase == "CONTROL" else 'c'
+        poly = Polygon(verts, edgecolor=color, facecolor='none', linewidth=2)
+        self.ax.add_patch(poly)
+        
+        y_grid, x_grid = np.mgrid[:Y_PIXELS, :X_PIXELS]
+        points = np.vstack((x_grid.flatten(), y_grid.flatten())).T
+        grid_mask = Path(verts).contains_points(points).reshape((Y_PIXELS, X_PIXELS))
+        
+        self.masks[self.current_phase].append(grid_mask)
+        self.patches[self.current_phase].append(poly)
+        self.update_title()
+
+    def undo_last_selection(self):
+        phase = self.current_phase
+        if phase == "DONE": phase = "BACKGROUND"; self.current_phase = "BACKGROUND"
+        if not self.masks[phase] and phase == "BACKGROUND": phase = "CONTROL"; self.current_phase = "CONTROL"
+        if not self.masks[phase] and phase == "CONTROL": phase = "TREATED"; self.current_phase = "TREATED"
+        
+        if self.masks[phase]:
+            self.masks[phase].pop()
+            self.patches[phase].pop().remove()
+            print("Undid last traced region.")
+        else:
+            print("Nothing left to undo.")
+        self.update_title()
+
+    def advance_phase(self):
+        if self.current_phase == "TREATED": self.current_phase = "CONTROL"
+        elif self.current_phase == "CONTROL": self.current_phase = "BACKGROUND"
+        elif self.current_phase == "BACKGROUND": self.current_phase = "DONE"
+        self.update_title()
+
+    def on_key(self, event):
+        if event.key == 'n':
+            self.advance_phase()
+        elif event.key == 'z':
+            self.undo_last_selection()
+        elif event.key == 'enter':
+            self.process_selected_data()
+
+    def process_selected_data(self):
+        if not self.masks["BACKGROUND"] or not self.masks["TREATED"]:
+            messagebox.showwarning("Warning", "You must select at least one Treated zone and a Background region before processing!")
+            return
+        plt.close(self.fig)
+        
+        def get_mask_list_intensity_over_time(stack, masks_list):
+            intensities = []
+            for frame in stack:
+                frame_vals = [np.mean(frame[mask]) for mask in masks_list]
+                intensities.append(np.mean(frame_vals))
+            return np.array(intensities)
+            
+        gfp_t_raw = get_mask_list_intensity_over_time(self.gfp_stack, self.masks["TREATED"])
+        gfp_c_raw = get_mask_list_intensity_over_time(self.gfp_stack, self.masks["CONTROL"]) if self.masks["CONTROL"] else np.ones(NUM_FRAMES)
+        gfp_bg_raw = get_mask_list_intensity_over_time(self.gfp_stack, self.masks["BACKGROUND"])
+        
+        mcherry_t_raw = get_mask_list_intensity_over_time(self.mcherry_stack, self.masks["TREATED"])
+        mcherry_c_raw = get_mask_list_intensity_over_time(self.mcherry_stack, self.masks["CONTROL"]) if self.masks["CONTROL"] else np.ones(NUM_FRAMES)
+        mcherry_bg_raw = get_mask_list_intensity_over_time(self.mcherry_stack, self.masks["BACKGROUND"])
+        
+        gfp_t_corr = (gfp_t_raw - gfp_bg_raw) / (gfp_t_raw[0] - gfp_bg_raw[0])
+        gfp_c_corr = (gfp_c_raw - gfp_bg_raw) / (gfp_c_raw[0] - gfp_bg_raw[0]) if self.masks["CONTROL"] else np.ones(NUM_FRAMES)
+        mcherry_t_corr = (mcherry_t_raw - mcherry_bg_raw) / (mcherry_t_raw[0] - mcherry_bg_raw[0])
+        mcherry_c_corr = (mcherry_c_raw - mcherry_bg_raw) / (mcherry_c_raw[0] - mcherry_bg_raw[0]) if self.masks["CONTROL"] else np.ones(NUM_FRAMES)
+        
+        time_axis = np.arange(NUM_FRAMES) * FRAME_TIME_STEP
+        
+        k_gfp_treated = fit_decay_constant(time_axis, gfp_t_corr)
+        k_gfp_control = fit_decay_constant(time_axis, gfp_c_corr) if self.masks["CONTROL"] else 0.0
+        k_mcherry_treated = fit_decay_constant(time_axis, mcherry_t_corr)
+        k_mcherry_control = fit_decay_constant(time_axis, mcherry_c_corr) if self.masks["CONTROL"] else 0.0
+        
+        print(f"\n--- FIT RESULTS ---")
+        print(f"GFP Treated Decay Constant (k): {k_gfp_treated:.5f}")
+        print(f"mCherry Treated Decay Constant (k): {k_mcherry_treated:.5f}")
+        
+        summary_file = "master_kinetics_summary.csv"
+        new_rows = [
+            {"Dataset": self.dataset_name, "Wavelength": self.wavelength, "Condition": self.condition, "Fluorophore": "GFP", "Type": "Treated", "Decay_Constant_k": k_gfp_treated},
+            {"Dataset": self.dataset_name, "Wavelength": self.wavelength, "Condition": self.condition, "Fluorophore": "GFP", "Type": "Control", "Decay_Constant_k": k_gfp_control},
+            {"Dataset": self.dataset_name, "Wavelength": self.wavelength, "Condition": self.condition, "Fluorophore": "mCherry", "Type": "Treated", "Decay_Constant_k": k_mcherry_treated},
+            {"Dataset": self.dataset_name, "Wavelength": self.wavelength, "Condition": self.condition, "Fluorophore": "mCherry", "Type": "Control", "Decay_Constant_k": k_mcherry_control}
+        ]
+        
+        summary_df = pd.DataFrame(new_rows)
+        if os.path.exists(summary_file):
+            master_df = pd.read_csv(summary_file)
+            master_df = master_df[master_df["Dataset"] != self.dataset_name]
+            master_df = pd.concat([master_df, summary_df], ignore_index=True)
+        else:
+            master_df = summary_df
+        master_df.to_csv(summary_file, index=False)
+        print(f"Master rates log successfully updated in '{summary_file}'")
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        
+        ax1.plot(time_axis, gfp_t_corr, 'go', alpha=0.5, label='GFP Treated Data')
+        if not np.isnan(k_gfp_treated):
+            ax1.plot(time_axis, exponential_decay(time_axis, gfp_t_corr[0]-gfp_t_corr[-1], k_gfp_treated, gfp_t_corr[-1]), 'g-', linewidth=2, label=f'Fit (k={k_gfp_treated:.4f})')
+        if self.masks["CONTROL"]: ax1.plot(time_axis, gfp_c_corr, 'g--', label='GFP Control')
+        ax1.set_title("GFP Kinetic Tracking")
+        ax1.set_xlabel("Time (Frames)"); ax1.set_ylabel("F / F_0"); ax1.legend(); ax1.grid(True)
+        
+        ax2.plot(time_axis, mcherry_t_corr, 'ro', alpha=0.5, label='mCherry Treated Data')
+        if not np.isnan(k_mcherry_treated):
+            ax2.plot(time_axis, exponential_decay(time_axis, mcherry_t_corr[0]-mcherry_t_corr[-1], k_mcherry_treated, mcherry_t_corr[-1]), 'r-', linewidth=2, label=f'Fit (k={k_mcherry_treated:.4f})')
+        if self.masks["CONTROL"]: ax2.plot(time_axis, mcherry_c_corr, 'r--', label='mCherry Control')
+        ax2.set_title("mCherry Kinetic Tracking")
+        ax2.set_xlabel("Time (Frames)"); ax2.set_ylabel("F / F_0"); ax2.legend(); ax2.grid(True)
+        
+        plt.suptitle(f"Exponential Decay Fits: {self.dataset_name} ({self.wavelength} - {self.condition})")
+        plt.show()
+
+if __name__ == "__main__":
+    import matplotlib
+    try: matplotlib.use('Qt5Agg')
+    except: matplotlib.use('TkAgg')
+    analyzer = KeyboardCellAnalyzer()
+    analyzer.run_pipeline()

@@ -1,0 +1,111 @@
+import os
+import glob
+import cv2
+import numpy as np
+import pandas as pd
+
+DATA_DIR = r"C:\Users\calap\Box\(L2 Sensitive) zhan2017\Zhang lab data\AAppel\2026-08-04 Bacteria Eff\Cellpose formated"
+OUTPUT_DIR = os.path.join(DATA_DIR, "recovered_online_cellpose_output")
+
+def split_into_quadrants(img_array):
+    """Splits a 2D matrix into 4 equal quadrants (Q1-Q4)."""
+    h, w = img_array.shape[:2]
+    mid_h, mid_w = h // 2, w // 2
+    return {
+        "Q1_TopLeft": img_array[0:mid_h, 0:mid_w],
+        "Q2_TopRight": img_array[0:mid_h, mid_w:w],
+        "Q3_BottomLeft": img_array[mid_h:h, 0:mid_w],
+        "Q4_BottomRight": img_array[mid_h:h, mid_w:w],
+    }
+
+def extract_masks_from_flow_pngs(input_dir, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+
+    png_files = glob.glob(os.path.join(input_dir, "*.png"))
+    if not png_files:
+        print(f"No PNG files found in: {input_dir}")
+        return
+
+    records = []
+
+    for png_path in png_files:
+        filename = os.path.basename(png_path)
+        base_name = os.path.splitext(filename)[0]
+
+        # Read RGB flow image
+        img = cv2.imread(png_path, cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+
+        # Extract true binary mask from flow image:
+        # A pixel belongs to a cell if ANY RGB channel > 10
+        cell_pixels = np.any(img > 10, axis=-1)
+        binary_mask = cell_pixels.astype(np.uint8) * 255
+
+        # Split mask into 4 quadrants
+        quads = split_into_quadrants(binary_mask)
+
+        is_treated = "treated" in base_name.lower() and "untreated" not in base_name.lower()
+        condition = "Treated" if is_treated else "Untreated"
+
+        for quad_key, mask_q in quads.items():
+            # Save extracted quadrant mask image
+            cv2.imwrite(os.path.join(output_dir, f"{base_name}_{quad_key}_mask.png"), mask_q)
+
+            occupied_px = cv2.countNonZero(mask_q)
+            total_px = mask_q.size
+            coverage_pct = (occupied_px / total_px) * 100
+
+            records.append({
+                "Image Name": filename,
+                "Condition": condition,
+                "Quadrant": quad_key,
+                "Occupied Area (Pixels)": occupied_px,
+                "Quadrant Total (Pixels)": total_px,
+                "Area Coverage (%)": round(coverage_pct, 3)
+            })
+
+        # Record total image metrics
+        full_occ = cv2.countNonZero(binary_mask)
+        full_total = binary_mask.size
+        records.append({
+            "Image Name": filename,
+            "Condition": condition,
+            "Quadrant": "Full Image Total",
+            "Occupied Area (Pixels)": full_occ,
+            "Quadrant Total (Pixels)": full_total,
+            "Area Coverage (%)": round((full_occ / full_total) * 100, 3)
+        })
+
+    # Save summary dataframe to CSV
+    df = pd.DataFrame(records)
+    csv_path = os.path.join(output_dir, "online_cellpose_area_coverage.csv")
+    df.to_csv(csv_path, index=False)
+
+    print("==================================================================")
+    print("--- RECOVERED QUADRANT COVERAGE TABLE ---")
+    print("==================================================================")
+    print(df.to_string(index=False))
+
+    # Calculate overall Inhibition Efficiency (%)
+    untreated_df = df[(df["Condition"] == "Untreated") & (df["Quadrant"] == "Full Image Total")]
+    treated_df = df[(df["Condition"] == "Treated") & (df["Quadrant"] == "Full Image Total")]
+
+    if not untreated_df.empty and not treated_df.empty:
+        avg_u_cov = untreated_df["Area Coverage (%)"].mean()
+        avg_t_cov = treated_df["Area Coverage (%)"].mean()
+        
+        inhibition_eff = (1.0 - (avg_t_cov / avg_u_cov)) * 100 if avg_u_cov > 0 else 0.0
+
+        print("\n==================================================================")
+        print("--- FINAL BACTERIAL INHIBITION SUMMARY ---")
+        print("==================================================================")
+        print(f"Mean Untreated Coverage: {avg_u_cov:.3f}%")
+        print(f"Mean Treated Coverage:   {avg_t_cov:.3f}%")
+        print(f"--> Inhibition Efficiency: {inhibition_eff:.2f}%")
+        print("==================================================================\n")
+
+    print(f"Saved quadrant mask files and CSV report to:\n{output_dir}")
+
+if __name__ == "__main__":
+    extract_masks_from_flow_pngs(DATA_DIR, OUTPUT_DIR)

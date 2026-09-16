@@ -1,0 +1,623 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+import tkinter as tk
+import customtkinter as ctk
+import matplotlib.pyplot as plt
+from matplotlib.widgets import LassoSelector
+from matplotlib.path import Path
+from matplotlib.patches import Polygon
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from scipy.optimize import curve_fit
+
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+# ==============================================================================
+# MATHEMATICAL FIT ENGINE
+# ==============================================================================
+def exponential_decay(t, A, k, C):
+    return A * np.exp(-k * t) + C
+
+def fit_decay_constant(time_axis, intensity_profile):
+    try:
+        amplitude_guess = intensity_profile[0] - np.min(intensity_profile)
+        plateau_guess = np.min(intensity_profile)
+        k_guess = 0.01 if abs(amplitude_guess) < 0.05 else 0.05
+        
+        p0 = [amplitude_guess, k_guess, plateau_guess]
+        bounds = ([-2.0, 0.0, -0.5], [3.0, 20.0, 2.0])
+        
+        popt, _ = curve_fit(exponential_decay, time_axis, intensity_profile, p0=p0, bounds=bounds, maxfev=10000)
+        return popt[0], popt[1], popt[2]
+    except:
+        return np.nan, np.nan, np.nan
+
+# ==============================================================================
+# MAIN BATCH ANALYZER APPLICATION
+# ==============================================================================
+class AdvancedBatchCellAnalyzer(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        
+        self.title("Zhang Lab | Manual Lasso & Threshold Kinetics Dashboard")
+        self.geometry("1500x920")
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        self.fig_canvas = None
+        self.tk_canvas = None
+        self.fig_fit = None
+        self.fig_global = None
+        
+        self.dataset_prefixes = []
+        self.current_dataset_index = -1
+        self.master_folder_path = ""
+        
+        self.gfp_stack = None
+        self.mcherry_stack = None
+        self.mask_frame = None
+        self.dataset_name = "None"
+        self.wavelength = "Unknown"
+        self.condition = "Unknown"
+        self.x_pixels = 400
+        self.y_pixels = 400
+        self.num_frames = 50
+        
+        self.masks = {"TREATED": [], "CONTROL": [], "BACKGROUND": []}
+        self.patches = {"TREATED": [], "CONTROL": [], "BACKGROUND": []}
+        self.raw_hand_masks = {"TREATED": [], "CONTROL": [], "BACKGROUND": []}
+        self.scatter_artists = {"TREATED": [], "CONTROL": [], "BACKGROUND": []}
+        
+        self.active_run_traces_cache = {}
+
+        self.setup_ui_layout()
+
+    def setup_ui_layout(self):
+        self.grid_columnconfigure(0, weight=1)  
+        self.grid_columnconfigure(1, weight=4)  
+        self.grid_columnconfigure(2, weight=3)  
+        self.grid_rowconfigure(0, weight=1)
+
+        # PANEL 1: SIDEBAR
+        self.sidebar = ctk.CTkFrame(self, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        
+        lbl_title = ctk.CTkLabel(self.sidebar, text="Analysis Controls", font=ctk.CTkFont(size=16, weight="bold"))
+        lbl_title.pack(pady=(10, 8), padx=20)
+
+        self.btn_load_master = ctk.CTkButton(self.sidebar, text="Select Master Data Folder", command=self.load_flat_data_folder, fg_color="#1F6AA5")
+        self.btn_load_master.pack(pady=4, padx=20, fill="x")
+
+        self.lbl_queue_progress = ctk.CTkLabel(self.sidebar, text="Queue: 0/0 Completed", font=ctk.CTkFont(size=12, slant="italic"))
+        self.lbl_queue_progress.pack(pady=(4, 2), padx=20, anchor="w")
+        self.progress_bar = ctk.CTkProgressBar(self.sidebar)
+        self.progress_bar.pack(pady=(0, 8), padx=20, fill="x")
+        self.progress_bar.set(0)
+
+        self.config_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.config_frame.pack(pady=3, padx=20, fill="x")
+        
+        self.lbl_frames_entry = ctk.CTkLabel(self.config_frame, text="Frame Count:", font=ctk.CTkFont(weight="bold"))
+        self.lbl_frames_entry.grid(row=0, column=0, sticky="w")
+        self.frames_entry = ctk.CTkEntry(self.config_frame, width=60)
+        self.frames_entry.grid(row=0, column=1, sticky="e")
+        self.frames_entry.insert(0, "50")
+
+        self.seg_channel = ctk.CTkSegmentedButton(self.sidebar, values=["GFP (Lamin A) View", "mCherry (Chromatin) View"], command=self.on_channel_view_changed)
+        self.seg_channel.set("GFP (Lamin A) View")
+        self.seg_channel.pack(pady=6, padx=20, fill="x")
+
+        self.lbl_slider_title = ctk.CTkLabel(self.sidebar, text="Local Threshold: 20%", font=ctk.CTkFont(weight="bold"))
+        self.lbl_slider_title.pack(pady=(8, 1), padx=20, anchor="w")
+        self.thresh_slider = ctk.CTkSlider(self.sidebar, from_=0, to=95, number_of_steps=19, command=self.on_slider_value_changed)
+        self.thresh_slider.pack(pady=(0, 8), padx=20, fill="x")
+        self.thresh_slider.set(20)
+
+        self.phase_var = tk.StringVar(value="TREATED")
+        self.rdo_treated = ctk.CTkRadioButton(self.sidebar, text="Treated Cell (Red)", variable=self.phase_var, value="TREATED")
+        self.rdo_treated.pack(pady=2, padx=30, anchor="w")
+        self.rdo_control = ctk.CTkRadioButton(self.sidebar, text="Control Cell (Blue)", variable=self.phase_var, value="CONTROL")
+        self.rdo_control.pack(pady=2, padx=30, anchor="w")
+        self.rdo_bg = ctk.CTkRadioButton(self.sidebar, text="Background (Cyan)", variable=self.phase_var, value="BACKGROUND")
+        self.rdo_bg.pack(pady=2, padx=30, anchor="w")
+
+        self.btn_clear_current = ctk.CTkButton(self.sidebar, text="Clear Traces", fg_color="#7F8C8D", hover_color="#95A5A6", command=self.clear_current_traces)
+        self.btn_clear_current.pack(pady=(10, 3), padx=20, fill="x")
+
+        self.btn_undo = ctk.CTkButton(self.sidebar, text="Undo Shape", fg_color="#D9534F", hover_color="#C9302C", command=self.undo_last_shape)
+        self.btn_undo.pack(pady=3, padx=20, fill="x")
+
+        self.btn_prev = ctk.CTkButton(self.sidebar, text="← Previous Set", fg_color="#E67E22", hover_color="#D35400", command=self.navigate_to_previous_set)
+        self.btn_prev.pack(pady=3, padx=20, fill="x")
+
+        self.btn_process = ctk.CTkButton(self.sidebar, text="Save & Next →", font=ctk.CTkFont(weight="bold"), fg_color="#5CB85C", hover_color="#4CAE4C", command=self.process_and_advance_queue)
+        self.btn_process.pack(pady=3, padx=20, fill="x")
+        
+        self.btn_refresh = ctk.CTkButton(self.sidebar, text="🔄 Refresh Plots", fg_color="#2980B9", hover_color="#3498DB", command=self.render_global_comparison_chart)
+        self.btn_refresh.pack(pady=(8, 3), padx=20, fill="x")
+        
+        self.btn_export_plots = ctk.CTkButton(self.sidebar, text="💾 Export Charts", font=ctk.CTkFont(weight="bold"), fg_color="#8E44AD", hover_color="#7D3C98", command=self.export_publication_plots)
+        self.btn_export_plots.pack(pady=3, padx=20, fill="x")
+
+        self.metadata_box = ctk.CTkTextbox(self.sidebar, height=90, activate_scrollbars=True, font=ctk.CTkFont(family="monospace", size=10))
+        self.metadata_box.pack(pady=(8, 5), padx=20, fill="x")
+        self.metadata_box.insert("0.0", "Status: Idle")
+        self.metadata_box.configure(state="disabled")
+
+        # PANEL 2: CENTER CANVAS
+        self.canvas_frame = ctk.CTkFrame(self)
+        self.canvas_frame.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+        self.lbl_canvas_status = ctk.CTkLabel(self.canvas_frame, text="Select folder to begin.", font=ctk.CTkFont(slant="italic"))
+        self.lbl_canvas_status.pack(expand=True)
+
+        # PANEL 3: RIGHT TABS
+        self.tabs_frame = ctk.CTkTabview(self)
+        self.tabs_frame.grid(row=0, column=2, sticky="nsew", padx=10, pady=10)
+        self.tab_current = self.tabs_frame.add("Current Fit Profiles")
+        self.tab_global = self.tabs_frame.add("Global Comparative Summary")
+
+    def on_channel_view_changed(self, value):
+        self.build_interactive_canvas()
+        for phase in ["TREATED", "CONTROL", "BACKGROUND"]:
+            for idx in range(len(self.raw_hand_masks[phase])):
+                self.apply_threshold_to_slot(phase, idx)
+        self.tk_canvas.draw_idle()
+
+    def on_slider_value_changed(self, value):
+        pct = int(value)
+        self.lbl_slider_title.configure(text=f"Local Threshold: {pct}%")
+        phase = self.phase_var.get()
+        for idx in range(len(self.raw_hand_masks[phase])):
+            self.apply_threshold_to_slot(phase, idx)
+        self.tk_canvas.draw_idle()
+
+    def apply_threshold_to_slot(self, phase, index):
+        raw_mask = self.raw_hand_masks[phase][index]
+        color = 'r' if phase == "TREATED" else 'b' if phase == "CONTROL" else 'c'
+        
+        if self.scatter_artists[phase][index] is not None:
+            self.scatter_artists[phase][index].remove()
+            self.scatter_artists[phase][index] = None
+
+        final_mask = raw_mask
+        
+        if phase in ["TREATED", "CONTROL"]:
+            # Evaluate active channel frame 0 intensities inside the lasso
+            active_frame = self.gfp_stack[0] if self.seg_channel.get() == "GFP (Lamin A) View" else self.mcherry_stack[0]
+            local_pixels = active_frame[raw_mask]
+            if local_pixels.size > 0:
+                mn, mx = np.min(local_pixels), np.max(local_pixels)
+                thresh_line = mn + (self.thresh_slider.get() / 100.0) * (mx - mn)
+                candidate_mask = np.logical_and(raw_mask, active_frame >= thresh_line)
+                if np.sum(candidate_mask) > 0:
+                    final_mask = candidate_mask
+
+        self.masks[phase][index] = final_mask
+
+        y_idx, x_idx = np.where(final_mask)
+        if y_idx.size > 0:
+            scatter_art = self.ax_canvas.scatter(x_idx, y_idx, color=color, s=2, alpha=0.45)
+            self.scatter_artists[phase][index] = scatter_art
+
+    def load_flat_data_folder(self):
+        self.master_folder_path = tk.filedialog.askdirectory(title="Select Folder Containing All Text Files")
+        if not self.master_folder_path: return
+        
+        all_files = os.listdir(self.master_folder_path)
+        prefixes = set()
+        for f in all_files:
+            if f.endswith(".txt"):
+                base_prefix = re.split(r'_(GFP|mCherry|Mask|Parameter|Parameters)', f, flags=re.IGNORECASE)[0]
+                prefixes.add(base_prefix)
+                
+        valid_prefixes = [p for p in prefixes if any(f.lower() == f"{p.lower()}_gfp.txt" for f in all_files) 
+                          and any(f.lower() == f"{p.lower()}_mcherry.txt" for f in all_files) 
+                          and any(f.lower() == f"{p.lower()}_mask.txt" for f in all_files)]
+                
+        if not valid_prefixes:
+            tk.messagebox.showerror("Error", "No valid dataset groups found.")
+            return
+            
+        self.dataset_prefixes = sorted(valid_prefixes)
+        self.current_dataset_index = 0
+        self.initialize_dataset_at_index(self.current_dataset_index)
+        self.render_global_comparison_chart()
+
+    def initialize_dataset_at_index(self, index):
+        if index < 0 or index >= len(self.dataset_prefixes): return
+        prefix = self.dataset_prefixes[index]
+        self.dataset_name = prefix
+        
+        try:
+            user_frames = int(self.frames_entry.get())
+            self.num_frames = user_frames if user_frames > 1 else 50
+        except ValueError:
+            self.num_frames = 50
+            self.frames_entry.delete(0, tk.END)
+            self.frames_entry.insert(0, "50")
+        
+        all_files = os.listdir(self.master_folder_path)
+        gfp_file = next(f for f in all_files if f.lower() == f"{prefix.lower()}_gfp.txt")
+        mcherry_file = next(f for f in all_files if f.lower() == f"{prefix.lower()}_mcherry.txt")
+        mask_file = next(f for f in all_files if f.lower() == f"{prefix.lower()}_mask.txt")
+        param_file = next((f for f in all_files if f.lower() in [f"{prefix.lower()}_parameters.txt", f"{prefix.lower()}_parameter.txt"]), None)
+
+        if param_file:
+            with open(os.path.join(self.master_folder_path, param_file), 'r') as f:
+                content = f.read()
+            x_match = re.search(r'# of Pixels:\s*(\d+)', content)
+            frame_match = re.search(r'# of Images:\s*(\d+)', content)
+            self.x_pixels = int(x_match.group(1)) if x_match else 400
+            self.y_pixels = self.x_pixels
+            if frame_match and int(frame_match.group(1)) > 1:
+                self.num_frames = int(frame_match.group(1))
+                self.frames_entry.delete(0, tk.END)
+                self.frames_entry.insert(0, str(self.num_frames))
+
+        wave_match = re.search(r'(\d+nm)', prefix, re.IGNORECASE)
+        self.wavelength = wave_match.group(1) if wave_match else "Unknown"
+        self.condition = "Normoxia" if "norm" in prefix.lower() else "Hypoxia" if "hypo" in prefix.lower() else "Unknown"
+
+        def parse_data_file(name):
+            with open(os.path.join(self.master_folder_path, name), 'r') as f:
+                content = f.read()
+            return np.array(re.findall(r'[-+]?\d*\.\d+|\d+', content), dtype=np.float64)
+
+        gfp_data = parse_data_file(gfp_file)
+        mcherry_data = parse_data_file(mcherry_file)
+        mask_data = parse_data_file(mask_file)
+
+        pts_per_frame = self.x_pixels * self.y_pixels
+        self.gfp_stack = gfp_data[:self.num_frames * pts_per_frame].reshape((self.num_frames, self.y_pixels, self.x_pixels))
+        self.mcherry_stack = mcherry_data[:self.num_frames * pts_per_frame].reshape((self.num_frames, self.y_pixels, self.x_pixels))
+        self.mask_frame = mask_data[:pts_per_frame].reshape((self.y_pixels, self.x_pixels))
+
+        total_sets = len(self.dataset_prefixes)
+        self.lbl_queue_progress.configure(text=f"Batch: {index + 1}/{total_sets}")
+        self.progress_bar.set((index) / total_sets)
+
+        self.update_metadata_box_display()
+        self.clear_current_traces()
+
+    def update_metadata_box_display(self, anomaly_text=""):
+        total_sets = len(self.dataset_prefixes)
+        self.metadata_box.configure(state="normal")
+        self.metadata_box.delete("0.0", "end")
+        msg = f"Run: [{self.current_dataset_index+1}/{total_sets}]\nPrefix: {self.dataset_name}\nWave: {self.wavelength}\nCond: {self.condition}\nDim: {self.x_pixels}x{self.y_pixels}\nFrames: {self.num_frames}"
+        if anomaly_text:
+            msg += f"\n\n⚠️ SPREAD WARNING:\n{anomaly_text}"
+        self.metadata_box.insert("0.0", msg)
+        self.metadata_box.configure(state="disabled")
+
+    def clear_current_traces(self):
+        self.masks = {"TREATED": [], "CONTROL": [], "BACKGROUND": []}
+        self.patches = {"TREATED": [], "CONTROL": [], "BACKGROUND": []}
+        self.raw_hand_masks = {"TREATED": [], "CONTROL": [], "BACKGROUND": []}
+        self.scatter_artists = {"TREATED": [], "CONTROL": [], "BACKGROUND": []}
+        self.phase_var.set("TREATED")
+        self.build_interactive_canvas()
+
+    def navigate_to_previous_set(self):
+        if self.current_dataset_index > 0:
+            self.current_dataset_index -= 1
+            self.initialize_dataset_at_index(self.current_dataset_index)
+
+    def build_interactive_canvas(self):
+        self.update_idletasks()
+        if self.fig_canvas is not None:
+            plt.close(self.fig_canvas)
+
+        for widget in self.canvas_frame.winfo_children():
+            widget.destroy()
+
+        self.fig_canvas, self.ax_canvas = plt.subplots(figsize=(6, 6), facecolor="#2B2B2B")
+        
+        if self.seg_channel.get() == "mCherry (Chromatin) View":
+            self.ax_canvas.imshow(self.mcherry_stack[0], cmap='inferno')
+        else:
+            self.ax_canvas.imshow(self.gfp_stack[0], cmap='gray')
+            display_mask = np.where(self.mask_frame > (np.max(self.mask_frame) * 0.1), 1, 0)
+            self.ax_canvas.imshow(display_mask, cmap='Reds', alpha=0.15)
+            
+        self.ax_canvas.axis('off')
+        self.fig_canvas.tight_layout()
+        
+        self.tk_canvas = FigureCanvasTkAgg(self.fig_canvas, master=self.canvas_frame)
+        self.tk_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.lasso = LassoSelector(self.ax_canvas, self.on_lasso_release, props=dict(color='yellow', linewidth=1.5))
+        self.tk_canvas.draw()
+
+    def on_lasso_release(self, verts):
+        if len(verts) < 3: return
+        phase = self.phase_var.get()
+        color = 'r' if phase == "TREATED" else 'b' if phase == "CONTROL" else 'c'
+        
+        y_grid, x_grid = np.mgrid[:self.y_pixels, :self.x_pixels]
+        points = np.vstack((x_grid.flatten(), y_grid.flatten())).T
+        raw_mask = Path(verts).contains_points(points).reshape((self.y_pixels, self.x_pixels))
+        
+        poly = Polygon(verts, edgecolor=color, facecolor='none', linewidth=1.2, linestyle=':')
+        self.ax_canvas.add_patch(poly)
+        
+        self.raw_hand_masks[phase].append(raw_mask)
+        self.patches[phase].append(poly)
+        self.masks[phase].append(raw_mask)
+        self.scatter_artists[phase].append(None)
+        
+        active_idx = len(self.raw_hand_masks[phase]) - 1
+        self.apply_threshold_to_slot(phase, active_idx)
+        self.tk_canvas.draw_idle()
+
+    def undo_last_shape(self):
+        phase = self.phase_var.get()
+        if self.raw_hand_masks[phase]:
+            self.raw_hand_masks[phase].pop()
+            self.masks[phase].pop()
+            self.patches[phase].pop().remove()
+            if self.scatter_artists[phase][-1] is not None:
+                self.scatter_artists[phase].pop().remove()
+            else:
+                self.scatter_artists[phase].pop()
+            self.tk_canvas.draw_idle()
+
+    def process_and_advance_queue(self):
+        if not self.masks["BACKGROUND"] or not self.masks["TREATED"]:
+            tk.messagebox.showwarning("Warning", "Select Treated and Background regions.")
+            return
+
+        def get_mask_average_trace(stack, masks_list):
+            intensities = []
+            for frame in stack[:self.num_frames]:
+                frame_vals = [np.mean(frame[m]) for m in masks_list if np.any(m)]
+                intensities.append(np.mean(frame_vals) if frame_vals else 1.0)
+            return np.array(intensities)
+
+        # Extract raw traces
+        gfp_t = get_mask_average_trace(self.gfp_stack, self.masks["TREATED"])
+        gfp_c = get_mask_average_trace(self.gfp_stack, self.masks["CONTROL"]) if self.masks["CONTROL"] else np.ones(self.num_frames)
+        gfp_bg = get_mask_average_trace(self.gfp_stack, self.masks["BACKGROUND"])
+
+        mch_t = get_mask_average_trace(self.mcherry_stack, self.masks["TREATED"])
+        mch_c = get_mask_average_trace(self.mcherry_stack, self.masks["CONTROL"]) if self.masks["CONTROL"] else np.ones(self.num_frames)
+        mch_bg = get_mask_average_trace(self.mcherry_stack, self.masks["BACKGROUND"])
+
+        # Background subtraction
+        gfp_t_net = gfp_t - gfp_bg
+        gfp_c_net = gfp_c - gfp_bg if self.masks["CONTROL"] else np.ones(self.num_frames)
+        mch_t_net = mch_t - mch_bg
+        mch_c_net = mch_c - mch_bg if self.masks["CONTROL"] else np.ones(self.num_frames)
+
+        # Ratio-metric photobleaching correction (dividing out control decay)
+        gfp_t_norm = gfp_t_net / gfp_t_net[0]
+        gfp_c_norm = gfp_c_net / gfp_c_net[0] if self.masks["CONTROL"] else np.ones(self.num_frames)
+        gfp_t_corr = gfp_t_norm / np.clip(gfp_c_norm, 1e-4, None) if self.masks["CONTROL"] else gfp_t_norm
+
+        mch_t_norm = mch_t_net / mch_t_net[0]
+        mch_c_norm = mch_c_net / mch_c_net[0] if self.masks["CONTROL"] else np.ones(self.num_frames)
+        mcherry_t_corr = mch_t_norm / np.clip(mch_c_norm, 1e-4, None) if self.masks["CONTROL"] else mch_t_norm
+
+        time_axis = np.arange(self.num_frames)
+        A_gfp, k_gfp, C_gfp = fit_decay_constant(time_axis, gfp_t_corr)
+        A_mch, k_mcherry, C_mch = fit_decay_constant(time_axis, mcherry_t_corr)
+
+        self.active_run_traces_cache[self.dataset_name] = {
+            "time_axis": time_axis,
+            "gfp_data": gfp_t_corr, "gfp_fit": (A_gfp, k_gfp, C_gfp), "has_gfp_control": bool(self.masks["CONTROL"]), "gfp_control": gfp_c_norm,
+            "mch_data": mcherry_t_corr, "mch_fit": (A_mch, k_mcherry, C_mch), "has_mch_control": bool(self.masks["CONTROL"]), "mch_control": mch_c_norm
+        }
+
+        # Log metrics to spreadsheet
+        summary_file = os.path.join(self.master_folder_path, "master_kinetics_summary.csv")
+        new_rows = [
+            {"Dataset": self.dataset_name, "Wavelength": self.wavelength, "Condition": self.condition, "Fluorophore": "GFP-LaminA", "Type": "Treated", "Decay_Constant_k": k_gfp},
+            {"Dataset": self.dataset_name, "Wavelength": self.wavelength, "Condition": self.condition, "Fluorophore": "mCherry", "Type": "Treated", "Decay_Constant_k": k_mcherry}
+        ]
+        summary_df = pd.DataFrame(new_rows)
+        
+        try:
+            if os.path.exists(summary_file):
+                master_df = pd.read_csv(summary_file)
+                master_df = master_df[(master_df["Dataset"] != self.dataset_name)]
+                master_df = pd.concat([master_df, summary_df], ignore_index=True)
+            else:
+                master_df = summary_df
+            master_df.to_csv(summary_file, index=False)
+        except Exception as e:
+            tk.messagebox.showerror("Save Error", f"Could not update summary:\n{e}")
+            return
+
+        # Tab 1 individual plots
+        for widget in self.tab_current.winfo_children(): widget.destroy()
+        fig_fit, (ax1, ax2) = plt.subplots(1, 2, figsize=(7, 4), facecolor="#2B2B2B")
+        ax1.set_facecolor("#1E1E1E"); ax2.set_facecolor("#1E1E1E")
+
+        ax1.plot(time_axis, gfp_t_corr, 'go', alpha=0.4, label="Data")
+        if not np.isnan(k_gfp): ax1.plot(time_axis, exponential_decay(time_axis, A_gfp, k_gfp, C_gfp), 'g-', label=f"k={k_gfp:.4f}")
+        if self.masks["CONTROL"]: ax1.plot(time_axis, gfp_c_norm, 'g--', label="Control (Bleach)")
+        ax1.set_title("GFP-Lamin A Decays", color="white", fontsize=10); ax1.tick_params(colors="white"); ax1.legend(labelcolor="white", facecolor="#2B2B2B", edgecolor="none")
+
+        ax2.plot(time_axis, mcherry_t_corr, 'ro', alpha=0.4, label="Data")
+        if not np.isnan(k_mcherry): ax2.plot(time_axis, exponential_decay(time_axis, A_mch, k_mcherry, C_mch), 'r-', label=f"k={k_mcherry:.4f}")
+        if self.masks["CONTROL"]: ax2.plot(time_axis, mch_c_norm, 'r--', label="Control (Bleach)")
+        ax2.set_title("mCherry Decays", color="white", fontsize=10); ax2.tick_params(colors="white"); ax2.legend(labelcolor="white", facecolor="#2B2B2B", edgecolor="none")
+
+        fig_fit.tight_layout()
+        canvas_fit = FigureCanvasTkAgg(fig_fit, master=self.tab_current)
+        canvas_fit.get_tk_widget().pack(fill="both", expand=True)
+        canvas_fit.draw()
+
+        self.render_global_comparison_chart()
+        self.tabs_frame.set("Current Fit Profiles")
+        self.update_idletasks()
+
+        self.current_dataset_index += 1
+        if self.current_dataset_index < len(self.dataset_prefixes):
+            self.initialize_dataset_at_index(self.current_dataset_index)
+        else:
+            self.progress_bar.set(1.0)
+            self.lbl_queue_progress.configure(text="Batch Complete 🎉")
+            tk.messagebox.showinfo("Done", "All datasets cataloged.")
+
+    def process_and_pool_replicates_df(self):
+        summary_file = os.path.join(self.master_folder_path, "master_kinetics_summary.csv")
+        if not os.path.exists(summary_file) or os.path.getsize(summary_file) < 10: return None, ""
+        df = pd.read_csv(summary_file)
+        df['Wavelength_Num'] = df['Wavelength'].astype(str).str.extract(r'(\d+)').astype(float)
+        df = df.dropna(subset=['Wavelength_Num', 'Decay_Constant_k'])
+        
+        grouped = df.groupby(["Wavelength_Num", "Condition", "Fluorophore"]).agg(
+            Mean_k=('Decay_Constant_k', 'mean'),
+            Std_k=('Decay_Constant_k', 'std'),
+            Count=('Decay_Constant_k', 'count')
+        ).reset_index()
+        grouped['Std_k'] = grouped['Std_k'].fillna(0.0)
+        
+        anomaly_msg = ""
+        outliers = grouped[grouped['Std_k'] > 0.02]
+        if not outliers.empty:
+            lines = [f"• {r['Fluorophore']} ({int(r['Wavelength_Num'])}nm - {r['Condition']}): High spread (σ={r['Std_k']:.4f}, N={r['Count']})" for _, r in outliers.iterrows()]
+            anomaly_msg = "\n".join(lines)
+        return grouped, anomaly_msg
+
+    def generate_plots_engine(self, dark_mode=True):
+        grouped_df, anomaly_text = self.process_and_pool_replicates_df()
+        if grouped_df is None or grouped_df.empty: return None
+        self.update_metadata_box_display(anomaly_text)
+
+        marker_dict = {"Normoxia": "o", "Hypoxia": "s", "Unknown": "^"}
+        bg_col = "#2B2B2B" if dark_mode else "white"
+        face_col = "#1E1E1E" if dark_mode else "#F5F5F5"
+        txt_col = "white" if dark_mode else "black"
+        grid_col = "gray" if dark_mode else "darkgray"
+
+        fig_global = plt.figure(figsize=(11, 8), facecolor=bg_col)
+        gfp_pool = grouped_df[grouped_df["Fluorophore"] == "GFP-LaminA"]
+        mch_pool = grouped_df[grouped_df["Fluorophore"] == "mCherry"]
+
+        # 1. GFP Lamin A
+        ax1 = plt.subplot2grid((2, 2), (0, 0)); ax1.set_facecolor(face_col)
+        if not gfp_pool.empty:
+            for cond, col in [("Normoxia", "#5CB85C"), ("Hypoxia", "#2E7D32")]:
+                sub = gfp_pool[gfp_pool["Condition"] == cond].sort_values('Wavelength_Num')
+                if not sub.empty:
+                    ax1.plot(sub['Wavelength_Num'], sub['Mean_k'], color=col, marker=marker_dict.get(cond, "o"), markersize=8, linewidth=2, label=f"GFP-LaminA {cond}")
+                    ax1.errorbar(sub['Wavelength_Num'], sub['Mean_k'], yerr=sub['Std_k'], fmt='none', ecolor=col, elinewidth=1.5, capsize=4)
+        ax1.set_title("GFP-Lamin A Kinetics", color=txt_col, fontsize=11); ax1.tick_params(colors=txt_col); ax1.grid(True, linestyle=":", color=grid_col, alpha=0.3)
+        l1 = ax1.legend(facecolor=bg_col, edgecolor="none"); [t.set_color(txt_col) for t in l1.get_texts()] if l1 else None
+
+        # 2. mCherry
+        ax2 = plt.subplot2grid((2, 2), (0, 1)); ax2.set_facecolor(face_col)
+        if not mch_pool.empty:
+            for cond, col in [("Normoxia", "#D9534F"), ("Hypoxia", "#C0392B")]:
+                sub = mch_pool[mch_pool["Condition"] == cond].sort_values('Wavelength_Num')
+                if not sub.empty:
+                    ax2.plot(sub['Wavelength_Num'], sub['Mean_k'], color=col, marker=marker_dict.get(cond, "o"), markersize=8, linewidth=2, label=f"mCherry {cond}")
+                    ax2.errorbar(sub['Wavelength_Num'], sub['Mean_k'], yerr=sub['Std_k'], fmt='none', ecolor=col, elinewidth=1.5, capsize=4)
+        ax2.set_title("mCherry Kinetics", color=txt_col, fontsize=11); ax2.tick_params(colors=txt_col); ax2.grid(True, linestyle=":", color=grid_col, alpha=0.3)
+        l2 = ax2.legend(facecolor=bg_col, edgecolor="none"); [t.set_color(txt_col) for t in l2.get_texts()] if l2 else None
+
+        # 3. Combined View
+        ax3 = plt.subplot2grid((2, 2), (1, 0), colspan=2); ax3.set_facecolor(face_col)
+        color_map = {("GFP-LaminA", "Normoxia"): "#5CB85C", ("GFP-LaminA", "Hypoxia"): "#2E7D32", ("mCherry", "Normoxia"): "#D9534F", ("mCherry", "Hypoxia"): "#C0392B"}
+        for (fl, cond), grp in grouped_df.groupby(["Fluorophore", "Condition"]):
+            c = color_map.get((fl, cond), "blue")
+            if not grp.empty:
+                grp = grp.sort_values(by='Wavelength_Num')
+                lbl = f"LaminA [{cond}]" if "GFP-LaminA" in fl else f"mCherry [{cond}]"
+                ax3.plot(grp['Wavelength_Num'], grp['Mean_k'], color=c, marker=marker_dict.get(cond, "o"), markersize=8, linewidth=2, label=lbl)
+                ax3.errorbar(grp['Wavelength_Num'], grp['Mean_k'], yerr=grp['Std_k'], fmt='none', ecolor=c, elinewidth=1.5, capsize=4)
+        ax3.set_title("Unified Pooled Response Matrix", color=txt_col, fontsize=11); ax3.set_xlabel("Wavelength (nm)", color=txt_col); ax3.set_ylabel("Mean Decay Rate (k)", color=txt_col)
+        ax3.tick_params(colors=txt_col); ax3.grid(True, linestyle=":", color=grid_col, alpha=0.3)
+        l3 = ax3.legend(facecolor=bg_col, edgecolor="none"); [t.set_color(txt_col) for t in l3.get_texts()] if l3 else None
+
+        fig_global.tight_layout()
+        return fig_global
+
+    def render_global_comparison_chart(self):
+        self.update_idletasks()
+        if getattr(self, 'fig_global', None) is not None:
+            plt.close(self.fig_global)
+
+        for widget in self.tab_global.winfo_children():
+            widget.destroy()
+
+        self.fig_global = self.generate_plots_engine(dark_mode=True)
+        if self.fig_global is None: return
+        canvas_global = FigureCanvasTkAgg(self.fig_global, master=self.tab_global)
+        canvas_global.get_tk_widget().pack(fill="both", expand=True)
+        canvas_global.draw()
+
+    def export_publication_plots(self):
+        grouped_df, _ = self.process_and_pool_replicates_df()
+        if grouped_df is None or grouped_df.empty: return
+            
+        target_dir = os.path.abspath(self.master_folder_path)
+        individual_plots_dir = os.path.join(target_dir, "Individual_Decay_Plots")
+        os.makedirs(individual_plots_dir, exist_ok=True)
+        
+        for name, traces in self.active_run_traces_cache.items():
+            fig_ind, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4.5))
+            t_axis = traces["time_axis"]
+            
+            ax1.plot(t_axis, traces["gfp_data"], 'go', alpha=0.5, label="Data")
+            A, k, C = traces["gfp_fit"]
+            if not np.isnan(k): ax1.plot(t_axis, exponential_decay(t_axis, A, k, C), 'g-', label=f"Fit (k={k:.4f})")
+            if traces["has_gfp_control"]: ax1.plot(t_axis, traces["gfp_control"], 'g--', label="Control (Bleach)")
+            ax1.set_title("GFP-Lamin A Profile"); ax1.set_xlabel("Frames"); ax1.set_ylabel("F/F0 (Corrected)"); ax1.grid(True, linestyle=":"); ax1.legend()
+            
+            ax2.plot(t_axis, traces["mch_data"], 'ro', alpha=0.5, label="Data")
+            A_m, k_m, C_m = traces["mch_fit"]
+            if not np.isnan(k_m): ax2.plot(t_axis, exponential_decay(t_axis, A_m, k_m, C_m), 'r-', label=f"Fit (k={k_m:.4f})")
+            if traces["has_mch_control"]: ax2.plot(t_axis, traces["mch_control"], 'r--', label="Control (Bleach)")
+            ax2.set_title("mCherry Profile"); ax2.set_xlabel("Frames"); ax2.set_ylabel("F/F0 (Corrected)"); ax2.grid(True, linestyle=":"); ax2.legend()
+            
+            plt.suptitle(f"Decay Profile: {name}", fontsize=11, weight="bold")
+            plt.tight_layout()
+            fig_ind.savefig(os.path.join(individual_plots_dir, f"{name}_decay_fit.png"), dpi=300)
+            plt.close(fig_ind)
+
+        gfp_pool = grouped_df[grouped_df["Fluorophore"] == "GFP-LaminA"]
+        mch_pool = grouped_df[grouped_df["Fluorophore"] == "mCherry"]
+        marker_dict = {"Normoxia": "o", "Hypoxia": "s", "Unknown": "^"}
+        
+        fig1, ax1 = plt.subplots(figsize=(6, 5))
+        for cond, col in [("Normoxia", "#5CB85C"), ("Hypoxia", "#2E7D32")]:
+            sub = gfp_pool[gfp_pool["Condition"] == cond].sort_values('Wavelength_Num')
+            if not sub.empty:
+                ax1.plot(sub['Wavelength_Num'], sub['Mean_k'], color=col, marker=marker_dict.get(cond, "o"), markersize=8, linewidth=2, label=f"GFP-LaminA {cond}")
+                ax1.errorbar(sub['Wavelength_Num'], sub['Mean_k'], yerr=sub['Std_k'], fmt='none', ecolor=col, elinewidth=1.5, capsize=4)
+        ax1.set_title("Pooled GFP-Lamin A Spectral Kinetics"); ax1.set_xlabel("Wavelength (nm)"); ax1.set_ylabel("Mean k (s^-1)"); ax1.grid(True, linestyle=":"); ax1.legend()
+        fig1.tight_layout(); fig1.savefig(os.path.join(target_dir, "pooled_gfp_laminA_spectral_decay.png"), dpi=300); plt.close(fig1)
+
+        fig2, ax2 = plt.subplots(figsize=(6, 5))
+        for cond, col in [("Normoxia", "#D9534F"), ("Hypoxia", "#C0392B")]:
+            sub = mch_pool[mch_pool["Condition"] == cond].sort_values('Wavelength_Num')
+            if not sub.empty:
+                ax2.plot(sub['Wavelength_Num'], sub['Mean_k'], color=col, marker=marker_dict.get(cond, "o"), markersize=8, linewidth=2, label=f"mCherry {cond}")
+                ax2.errorbar(sub['Wavelength_Num'], sub['Mean_k'], yerr=sub['Std_k'], fmt='none', ecolor=col, elinewidth=1.5, capsize=4)
+        ax2.set_title("Pooled mCherry Kinetics"); ax2.set_xlabel("Wavelength (nm)"); ax2.set_ylabel("Mean k (s^-1)"); ax2.grid(True, linestyle=":"); ax2.legend()
+        fig2.tight_layout(); fig2.savefig(os.path.join(target_dir, "pooled_mcherry_spectral_decay.png"), dpi=300); plt.close(fig2)
+
+        fig3, ax3 = plt.subplots(figsize=(8, 5.5))
+        color_map = {("GFP-LaminA", "Normoxia"): "#5CB85C", ("GFP-LaminA", "Hypoxia"): "#2E7D32", ("mCherry", "Normoxia"): "#D9534F", ("mCherry", "Hypoxia"): "#C0392B"}
+        for (fl, cond), grp in grouped_df.groupby(["Fluorophore", "Condition"]):
+            c = color_map.get((fl, cond), "blue")
+            if not grp.empty:
+                grp = grp.sort_values(by='Wavelength_Num')
+                lbl = f"LaminA [{cond}]" if "GFP-LaminA" in fl else f"mCherry [{cond}]"
+                ax3.plot(grp['Wavelength_Num'], grp['Mean_k'], color=c, marker=marker_dict.get(cond, "o"), markersize=8, linewidth=2, label=lbl)
+                ax3.errorbar(grp['Wavelength_Num'], grp['Mean_k'], yerr=grp['Std_k'], fmt='none', ecolor=c, elinewidth=1.5, capsize=4)
+        ax3.set_title("Unified Pooled Spectral Response Matrix"); ax3.set_xlabel("Wavelength (nm)"); ax3.set_ylabel("Mean k (s^-1)"); ax3.grid(True, linestyle=":"); ax3.legend()
+        fig3.tight_layout(); fig3.savefig(os.path.join(target_dir, "pooled_combined_spectral_kinetics.png"), dpi=300); plt.close(fig3)
+
+        tk.messagebox.showinfo("Export Complete", f"Exported individual decay fits and global response matrices to:\n{target_dir}")
+
+    def on_closing(self):
+        plt.close('all')
+        self.quit()
+        self.destroy()
+
+if __name__ == "__main__":
+    app = AdvancedBatchCellAnalyzer()
+    app.mainloop()
