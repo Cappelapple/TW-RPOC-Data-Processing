@@ -23,9 +23,14 @@ from ..core import fitting, metadata_parsing, dataset_io, segmentation, classic_
 
 SEGMENTATION_METHOD_CELLPOSE = "Cellpose (GPU)"
 SEGMENTATION_METHODS = [SEGMENTATION_METHOD_CELLPOSE] + classic_segmentation.CLASSIC_METHODS
+
+FIT_MODEL_SINGLE = "Single-Exponential"
+FIT_MODEL_TWO_EXP = "Two-Exponential (free)"
+FIT_MODEL_FIXED_K = "Two-Exponential (fixed control k)"
+FIT_MODELS = [FIT_MODEL_SINGLE, FIT_MODEL_TWO_EXP, FIT_MODEL_FIXED_K]
 from .thread_bridge import MainThreadDispatcher
-from .box_sync import BoxSyncWorker
 from .analytics_window import AnalyticsDashboardWindow
+from .data_curation_window import DataCurationWindow
 
 
 class AdvancedBatchCellAnalyzer(ctk.CTk):
@@ -41,16 +46,22 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         self.im_artist = None
         self.lasso = None
         self.analytics_window = None
+        self.data_curation_window = None
 
         self.dataset_prefixes = []
+        # Which folder each prefix's files actually live in -- almost always
+        # master_folder_path, except for prefixes pulled in via "Add Folder"
+        # (Keep Current), which stays wired to master_folder_path for
+        # output (cache/summary CSV) while its own files live elsewhere.
+        self.dataset_source_folder = {}
         self.current_dataset_index = -1
         self.master_folder_path = ""
-        self.box_source_path = ""
 
         self.gfp_stack = None
         self.mcherry_stack = None
         self.mask_frame = None
         self.dataset_name = "None"
+        self.current_dataset_note = None
         self.wavelength = "Unknown"
         self.condition = "Unknown"
         self.power_mw = "Unknown"
@@ -73,17 +84,7 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         self.shared_control_library = {}
         self.last_anomaly_text = ""
 
-        # Threading / Ingestion. dataset_prefixes and sync_lock are shared
-        # (same objects) with box_sync, which mutates them in place.
-        self.sync_lock = threading.Lock()
         self.dispatcher = MainThreadDispatcher(self)
-        self.box_sync = BoxSyncWorker(
-            dispatcher=self.dispatcher,
-            dataset_prefixes=self.dataset_prefixes,
-            sync_lock=self.sync_lock,
-            on_dataset_synced=self._on_box_dataset_synced,
-            on_status_changed=self._on_box_status_changed,
-        )
 
         # Auto-segmentation (Cellpose). Model is loaded lazily on first use
         # and cached for the life of the app so repeated runs don't pay the
@@ -112,26 +113,14 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         lbl_title = ctk.CTkLabel(self.sidebar, text="Cappel Lab Controls", font=ctk.CTkFont(size=16, weight="bold"))
         lbl_title.pack(pady=(8, 4), padx=20)
 
-        self.btn_load_master = ctk.CTkButton(self.sidebar, text="1. Select Working Folder", command=self.load_flat_data_folder, fg_color="#1F6AA5")
+        self.btn_load_master = ctk.CTkButton(self.sidebar, text="Select Working Folder", command=self.load_flat_data_folder, fg_color="#1F6AA5")
         self.btn_load_master.pack(pady=2, padx=20, fill="x")
 
-        self.btn_sync_box = ctk.CTkButton(self.sidebar, text="2. Stream From Box Folder", command=self.setup_box_background_sync, fg_color="#2E7D32", hover_color="#1B5E20")
-        self.btn_sync_box.pack(pady=2, padx=20, fill="x")
+        self.btn_add_folder = ctk.CTkButton(self.sidebar, text="+ Add Folder (Keep Current)", command=self.add_data_folder, fg_color="#34495E", hover_color="#2C3E50")
+        self.btn_add_folder.pack(pady=2, padx=20, fill="x")
 
         self.btn_new_session = ctk.CTkButton(self.sidebar, text="\U0001f195 Start New Session (Archive Old Results)", command=self.start_new_session, fg_color="#B9770E", hover_color="#9C640C")
         self.btn_new_session.pack(pady=(2, 2), padx=20, fill="x")
-
-        # Ingestion Tracker Box
-        self.sync_status_frame = ctk.CTkFrame(self.sidebar, fg_color="#181818", corner_radius=6)
-        self.sync_status_frame.pack(pady=(4, 6), padx=20, fill="x")
-
-        self.lbl_download_counter = ctk.CTkLabel(
-            self.sync_status_frame,
-            text="Downloaded: 0  |  Pending: 0",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color="#A9DFBF"
-        )
-        self.lbl_download_counter.pack(pady=3, padx=10)
 
         self.lbl_queue_progress = ctk.CTkLabel(self.sidebar, text="Queue: 0/0 Completed", font=ctk.CTkFont(size=12, slant="italic"))
         self.lbl_queue_progress.pack(pady=(2, 2), padx=20, anchor="w")
@@ -322,6 +311,29 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         self.lbl_auto_run_status = ctk.CTkLabel(self.autorun_frame, text="Idle", font=ctk.CTkFont(size=10, slant="italic"), wraplength=280, justify="left")
         self.lbl_auto_run_status.pack(pady=(0, 6), padx=10, anchor="w")
 
+        # Fitting Panel: which decay model Save & Next fits on the corrected traces.
+        self.fitting_frame = ctk.CTkFrame(self.sidebar, fg_color="#1E1E1E", corner_radius=6)
+        self.fitting_frame.pack(pady=(2, 4), padx=15, fill="x")
+
+        lbl_fitting = ctk.CTkLabel(self.fitting_frame, text="Decay Fit Model", font=ctk.CTkFont(size=11, weight="bold"))
+        lbl_fitting.pack(pady=(4, 2), padx=10, anchor="w")
+
+        self.fit_model_var = tk.StringVar(value=FIT_MODEL_SINGLE)
+        self.fit_model_menu = ctk.CTkOptionMenu(self.fitting_frame, values=FIT_MODELS, variable=self.fit_model_var)
+        self.fit_model_menu.pack(pady=(0, 4), padx=10, fill="x")
+
+        lbl_fitting_note = ctk.CTkLabel(
+            self.fitting_frame,
+            text="Free: both rates fit with nothing pinned, on the control-corrected trace. "
+                 "Fixed: the control is fit alone first, then the raw (uncorrected) treated "
+                 "trace is fit with that rate pinned as one of the two components. Either way, "
+                 "the reported Decay_Constant_k is the non-imaging rate; both rates are still "
+                 "saved to the summary CSV.",
+            font=ctk.CTkFont(size=9, slant="italic"), text_color="#999999",
+            wraplength=280, justify="left"
+        )
+        lbl_fitting_note.pack(pady=(0, 6), padx=10, anchor="w")
+
         self.btn_clear_current = ctk.CTkButton(self.sidebar, text="Clear Traces", fg_color="#7F8C8D", hover_color="#95A5A6", command=self.clear_current_traces)
         self.btn_clear_current.pack(pady=(4, 2), padx=20, fill="x")
 
@@ -347,12 +359,15 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         self.btn_open_analytics = ctk.CTkButton(self.sidebar, text="\U0001f4ca Open Analytics Window", font=ctk.CTkFont(weight="bold"), fg_color="#2980B9", hover_color="#3498DB", command=self.toggle_analytics_window)
         self.btn_open_analytics.pack(pady=(6, 2), padx=20, fill="x")
 
+        self.btn_manage_data = ctk.CTkButton(self.sidebar, text="\U0001f4cb Manage Data (Include/Exclude)", fg_color="#6C7A89", hover_color="#596573", command=self.toggle_data_curation_window)
+        self.btn_manage_data.pack(pady=2, padx=20, fill="x")
+
         self.btn_export_plots = ctk.CTkButton(self.sidebar, text="\U0001f4be Export Charts", font=ctk.CTkFont(weight="bold"), fg_color="#8E44AD", hover_color="#7D3C98", command=self.export_publication_plots)
         self.btn_export_plots.pack(pady=2, padx=20, fill="x")
 
         self.metadata_box = ctk.CTkTextbox(self.sidebar, height=100, activate_scrollbars=True, font=ctk.CTkFont(family="monospace", size=10))
         self.metadata_box.pack(pady=(4, 4), padx=20, fill="x")
-        self.metadata_box.insert("0.0", "Status: Idle\nBox Stream: Offline")
+        self.metadata_box.insert("0.0", "Status: Idle")
         self.metadata_box.configure(state="disabled")
 
         # PANEL 2: MAIN IMAGE CANVAS
@@ -444,6 +459,16 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         if self.analytics_window is not None and self.analytics_window.winfo_exists():
             self.analytics_window.refresh_views()
 
+    def toggle_data_curation_window(self):
+        if not self.master_folder_path:
+            tk.messagebox.showwarning("No Folder", "Select a working folder first.")
+            return
+        if self.data_curation_window is None or not self.data_curation_window.winfo_exists():
+            self.data_curation_window = DataCurationWindow(self)
+        else:
+            self.data_curation_window.lift()
+            self.data_curation_window.reload()
+
     # ==============================================================================
     # CONTRAST MANAGEMENT (NON-DESTRUCTIVE)
     # ==============================================================================
@@ -499,45 +524,6 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         if self.im_artist is not None:
             self.im_artist.set_clim(self.curr_vmin, self.curr_vmax)
             self.tk_canvas.draw_idle()
-
-    # ==============================================================================
-    # BOX BACKGROUND WORKER & DYNAMIC QUEUEING
-    # ==============================================================================
-    def setup_box_background_sync(self):
-        if not self.master_folder_path:
-            tk.messagebox.showwarning("Prerequisite", "Select a local destination working folder first using button 1.")
-            return
-
-        box_dir = tk.filedialog.askdirectory(title="Select Source Box Drive / Sync Folder")
-        if not box_dir:
-            return
-
-        self.box_source_path = box_dir
-        self.box_sync.start(box_dir, self.master_folder_path)
-        self.btn_sync_box.configure(text="● Box Streaming Active", fg_color="#1B5E20")
-        self.update_metadata_box_display()
-
-    def _on_box_dataset_synced(self):
-        if self.current_dataset_index == -1 and self.dataset_prefixes:
-            self.current_dataset_index = 0
-            self.initialize_dataset_at_index(0)
-        else:
-            self._update_queue_ui_only()
-
-    def _on_box_status_changed(self):
-        self._update_sync_counter_labels()
-        self.update_metadata_box_display()
-
-    def _update_sync_counter_labels(self):
-        self.lbl_download_counter.configure(
-            text=f"Downloaded: {self.box_sync.count_downloaded}  |  Pending: {self.box_sync.count_pending}"
-        )
-
-    def _update_queue_ui_only(self):
-        total_sets = len(self.dataset_prefixes)
-        self.lbl_queue_progress.configure(text=f"Batch: {self.current_dataset_index + 1}/{total_sets}")
-        self.progress_bar.set((self.current_dataset_index) / max(1, total_sets))
-        self.update_metadata_box_display()
 
     # ==============================================================================
     # CANVAS & LASSO THRESHOLDING
@@ -613,29 +599,65 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
 
         all_files = os.listdir(self.master_folder_path)
         discovered = dataset_io.discover_dataset_prefixes(all_files)
-
-        with self.sync_lock:
-            # Mutate in place -- box_sync holds this same list object.
-            self.dataset_prefixes[:] = discovered
-            self.box_sync.count_downloaded = len(self.dataset_prefixes)
-            self._update_sync_counter_labels()
+        self.dataset_prefixes[:] = discovered
+        self.dataset_source_folder = {p: self.master_folder_path for p in discovered}
 
         if self.dataset_prefixes:
             self.current_dataset_index = 0
             self.initialize_dataset_at_index(self.current_dataset_index)
         else:
-            self.lbl_canvas_status.configure(text="Local folder loaded (0 sets). Ready to stream from Box.")
+            self.lbl_canvas_status.configure(text="Local folder loaded (0 sets).")
+
+    def add_data_folder(self):
+        """Pull more datasets in from a second folder without losing the
+        currently loaded queue. Output (cache, summary CSV) still always
+        goes to master_folder_path -- this only adds more prefixes to
+        process, each remembering which folder its own files live in."""
+        if not self.master_folder_path:
+            tk.messagebox.showwarning("Prerequisite", "Select a working folder first -- this adds to that queue, it doesn't start one.")
+            return
+
+        added_dir = tk.filedialog.askdirectory(title="Select Additional Folder to Add")
+        if not added_dir:
+            return
+
+        all_files = os.listdir(added_dir)
+        discovered = dataset_io.discover_dataset_prefixes(all_files)
+
+        new_prefixes = [p for p in discovered if p not in self.dataset_source_folder]
+        skipped = [p for p in discovered if p in self.dataset_source_folder]
+
+        for p in new_prefixes:
+            self.dataset_source_folder[p] = added_dir
+        self.dataset_prefixes.extend(new_prefixes)
+
+        total_sets = len(self.dataset_prefixes)
+        self.lbl_queue_progress.configure(text=f"Batch: {max(self.current_dataset_index + 1, 0)}/{total_sets}")
+
+        msg = f"Added {len(new_prefixes)} dataset(s) from:\n{added_dir}"
+        if skipped:
+            msg += f"\n\n{len(skipped)} skipped (prefix already in the queue):\n" + "\n".join(skipped[:10])
+            if len(skipped) > 10:
+                msg += f"\n...and {len(skipped) - 10} more"
+        tk.messagebox.showinfo("Folder Added", msg)
+
+        if self.current_dataset_index == -1 and self.dataset_prefixes:
+            self.current_dataset_index = 0
+            self.initialize_dataset_at_index(0)
 
     def initialize_dataset_at_index(self, index):
         if index < 0 or index >= len(self.dataset_prefixes): return
         prefix = self.dataset_prefixes[index]
         self.dataset_name = prefix
+        source_folder = self.dataset_source_folder.get(prefix, self.master_folder_path)
 
-        all_files = os.listdir(self.master_folder_path)
+        all_files = os.listdir(source_folder)
         channel_files = dataset_io.find_channel_files(prefix, all_files)
         if not dataset_io.is_complete(channel_files):
             tk.messagebox.showerror("Data Error", f"Dataset '{prefix}' is missing required files.")
             return
+
+        self.current_dataset_note = dataset_io.dataset_note(channel_files)
 
         self.x_pixels = 400
         self.y_pixels = 400
@@ -643,7 +665,7 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
 
         if channel_files["param"]:
             try:
-                with open(os.path.join(self.master_folder_path, channel_files["param"]), 'r') as f:
+                with open(os.path.join(source_folder, channel_files["param"]), 'r') as f:
                     content = f.read()
                 params = metadata_parsing.parse_parameters_file(content)
                 if "x_pixels" in params:
@@ -672,9 +694,9 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         else:
             self.condition = selected_cond
 
-        gfp_path = os.path.join(self.master_folder_path, channel_files["gfp"])
-        mcherry_path = os.path.join(self.master_folder_path, channel_files["mcherry"])
-        mask_path = os.path.join(self.master_folder_path, channel_files["mask"])
+        gfp_path = os.path.join(source_folder, channel_files["gfp"])
+        mcherry_path = os.path.join(source_folder, channel_files["mcherry"])
+        mask_path = os.path.join(source_folder, channel_files["mask"])
 
         try:
             self.gfp_stack, self.mcherry_stack, self.mask_frame, self.num_frames = dataset_io.load_dataset_stacks(
@@ -706,14 +728,13 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
 
     def update_metadata_box_display(self, anomaly_text=None):
         # anomaly_text=None means "leave whatever spread-warning was showing
-        # alone" (this is re-invoked every few seconds by the background sync,
-        # which has nothing to say about that warning either way).
+        # alone" (this is re-invoked from a few different places that have
+        # nothing to say about that warning either way).
         if anomaly_text is not None:
             self.last_anomaly_text = anomaly_text
         anomaly_text = self.last_anomaly_text
 
         total_sets = len(self.dataset_prefixes)
-        stream_status = "Streaming" if self.box_sync.active else "Offline"
 
         key = (self.condition, self.wavelength, self.power_mw)
         has_lib_control = key in self.shared_control_library
@@ -728,16 +749,13 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
             f"Prefix: {self.dataset_name}\n"
             f"Wave: {self.wavelength} | Cond: {self.condition} | Power: {self.power_mw}mW\n"
             f"Control Mode: {control_mode_str}\n"
-            f"Dim: {self.x_pixels}x{self.y_pixels} | Frames: {self.num_frames}\n"
-            f"Box: {stream_status} ({self.box_sync.last_sync_log})"
+            f"Dim: {self.x_pixels}x{self.y_pixels} | Frames: {self.num_frames}"
         )
-        if self.box_sync.count_pending > 0 and self.box_sync.pending_reasons:
-            shown = list(self.box_sync.pending_reasons.items())[:3]
-            lines = [f"  • {p}: {r}" for p, r in shown]
-            extra = len(self.box_sync.pending_reasons) - len(shown)
-            if extra > 0:
-                lines.append(f"  • ...and {extra} more")
-            msg += f"\n\n{self.box_sync.count_pending} Pending:\n" + "\n".join(lines)
+        if self.current_dataset_note:
+            msg += (
+                f"\n\n⚠️ Annotated file(s): {self.current_dataset_note}\n"
+                f"(excluded from Auto-Run -- process manually if you want to include it)"
+            )
         if anomaly_text:
             msg += f"\n\n⚠️ SPREAD WARNING:\n{anomaly_text}"
         self.metadata_box.insert("0.0", msg)
@@ -1048,14 +1066,43 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
             }
 
         time_axis = np.arange(self.num_frames)
-        A_gfp, k_gfp, C_gfp = fitting.fit_decay_constant(time_axis, trace_result["gfp_t_corr"])
-        A_mch, k_mcherry, C_mch = fitting.fit_decay_constant(time_axis, trace_result["mch_t_corr"])
+        fit_model = self.fit_model_var.get()
+
+        if fit_model == FIT_MODEL_TWO_EXP:
+            gfp_data_used = trace_result["gfp_t_corr"]
+            mch_data_used = trace_result["mch_t_corr"]
+            gfp_params = fitting.fit_biexponential_decay(time_axis, gfp_data_used)
+            mch_params = fitting.fit_biexponential_decay(time_axis, mch_data_used)
+            gfp_summary = fitting.fit_summary(gfp_params)
+            mch_summary = fitting.fit_summary(mch_params)
+        elif fit_model == FIT_MODEL_FIXED_K:
+            # The control fit supplies k1; the treated fit then runs on the
+            # RAW (uncorrected) trace, since pinning k1 is meant to represent
+            # the imaging component inside this fit, not on top of a trace
+            # that's already had it divided out.
+            gfp_data_used = trace_result["gfp_t_norm"]
+            mch_data_used = trace_result["mch_t_norm"]
+            _, k_gfp_control, _ = (fitting.fit_decay_constant(time_axis, trace_result["gfp_control_norm"])
+                                    if trace_result["has_gfp_control"] else (np.nan, np.nan, np.nan))
+            _, k_mch_control, _ = (fitting.fit_decay_constant(time_axis, trace_result["mch_control_norm"])
+                                    if trace_result["has_mch_control"] else (np.nan, np.nan, np.nan))
+            gfp_params = fitting.fit_biexponential_fixed_k1(time_axis, gfp_data_used, k_gfp_control)
+            mch_params = fitting.fit_biexponential_fixed_k1(time_axis, mch_data_used, k_mch_control)
+            gfp_summary = fitting.fit_summary_fixed_k1(gfp_params)
+            mch_summary = fitting.fit_summary_fixed_k1(mch_params)
+        else:
+            gfp_data_used = trace_result["gfp_t_corr"]
+            mch_data_used = trace_result["mch_t_corr"]
+            gfp_params = fitting.fit_decay_constant(time_axis, gfp_data_used)
+            mch_params = fitting.fit_decay_constant(time_axis, mch_data_used)
+            gfp_summary = fitting.fit_summary(gfp_params)
+            mch_summary = fitting.fit_summary(mch_params)
 
         self.active_run_traces_cache[self.dataset_name] = {
             "time_axis": time_axis,
-            "gfp_data": trace_result["gfp_t_corr"], "gfp_fit": (A_gfp, k_gfp, C_gfp),
+            "gfp_data": gfp_data_used, "gfp_fit": gfp_params, "gfp_fit_label": gfp_summary["label"],
             "has_gfp_control": trace_result["has_gfp_control"], "gfp_control": trace_result["gfp_control_norm"],
-            "mch_data": trace_result["mch_t_corr"], "mch_fit": (A_mch, k_mcherry, C_mch),
+            "mch_data": mch_data_used, "mch_fit": mch_params, "mch_fit_label": mch_summary["label"],
             "has_mch_control": trace_result["has_mch_control"], "mch_control": trace_result["mch_control_norm"],
             "borrowed_control": trace_result["borrowed_control"],
         }
@@ -1063,8 +1110,14 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         self.save_cache_to_disk()
 
         new_rows = [
-            {"Dataset": self.dataset_name, "Wavelength": self.wavelength, "Condition": self.condition, "Power_mW": self.power_mw, "Fluorophore": "GFP-LaminA", "Type": "Treated", "Decay_Constant_k": k_gfp},
-            {"Dataset": self.dataset_name, "Wavelength": self.wavelength, "Condition": self.condition, "Power_mW": self.power_mw, "Fluorophore": "mCherry", "Type": "Treated", "Decay_Constant_k": k_mcherry},
+            {"Dataset": self.dataset_name, "Wavelength": self.wavelength, "Condition": self.condition, "Power_mW": self.power_mw,
+             "Fluorophore": "GFP-LaminA", "Type": "Treated", "Fit_Model": gfp_summary["model"],
+             "Decay_Constant_k": gfp_summary["k"], "K_Fast": gfp_summary.get("k_fast"), "K_Slow": gfp_summary.get("k_slow"),
+             "K_Imaging_Fixed": gfp_summary.get("k_imaging"), "K_Action": gfp_summary.get("k_action")},
+            {"Dataset": self.dataset_name, "Wavelength": self.wavelength, "Condition": self.condition, "Power_mW": self.power_mw,
+             "Fluorophore": "mCherry", "Type": "Treated", "Fit_Model": mch_summary["model"],
+             "Decay_Constant_k": mch_summary["k"], "K_Fast": mch_summary.get("k_fast"), "K_Slow": mch_summary.get("k_slow"),
+             "K_Imaging_Fixed": mch_summary.get("k_imaging"), "K_Action": mch_summary.get("k_action")},
         ]
         try:
             persistence.append_summary_rows(self.master_folder_path, self.dataset_name, new_rows)
@@ -1119,8 +1172,24 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
             self._finish_auto_run()
             return
 
-        self.initialize_dataset_at_index(self.current_dataset_index)
         total = len(self.dataset_prefixes)
+        prefix = self.dataset_prefixes[self.current_dataset_index]
+
+        # Lab-annotated files (e.g. "..._mCherry_treated weak one.txt") are
+        # loadable for manual review but deliberately excluded from
+        # Auto-Run -- surface them in the skip report instead of segmenting
+        # data the annotation is flagging as questionable.
+        source_folder = self.dataset_source_folder.get(prefix, self.master_folder_path)
+        all_files = os.listdir(source_folder)
+        note = dataset_io.dataset_note(dataset_io.find_channel_files(prefix, all_files))
+        if note:
+            reason = f"annotated ({note}) -- review manually"
+            self.auto_run_skip_log.append((prefix, reason))
+            self.update_auto_run_status(f"[{self.current_dataset_index + 1}/{total}] Skipped {prefix}: {reason}")
+            self._auto_run_advance()
+            return
+
+        self.initialize_dataset_at_index(self.current_dataset_index)
         self.update_auto_run_status(f"[{self.current_dataset_index + 1}/{total}] Segmenting {self.dataset_name}...")
         self.run_auto_segmentation(on_complete=self._auto_run_after_segmentation)
 
@@ -1232,7 +1301,6 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         tk.messagebox.showinfo("Export Complete", f"Exported individual decay fits, global response matrices, and per-wavelength power-response plots to:\n{target_dir}")
 
     def on_closing(self):
-        self.box_sync.stop()
         self.save_cache_to_disk()
         # Safe here because the entire application is shutting down.
         plt.close('all')

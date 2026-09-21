@@ -13,7 +13,7 @@ running a Cellpose background thread.
 import numpy as np
 import matplotlib.pyplot as plt
 
-from .fitting import exponential_decay
+from .fitting import evaluate_fit, fit_succeeded, fit_summary
 
 MARKER_BY_CONDITION = {"Normoxia": "o", "Hypoxia": "s", "Unknown": "^"}
 LINESTYLES = ['-', '--', '-.', ':']
@@ -39,17 +39,18 @@ def build_current_fit_figure(traces):
     in-app preview panel it's embedded in)."""
     time_axis = traces["time_axis"]
     gfp_t_corr = traces["gfp_data"]
-    A_gfp, k_gfp, C_gfp = traces["gfp_fit"]
+    gfp_params = traces["gfp_fit"]
     mch_t_corr = traces["mch_data"]
-    A_mch, k_mcherry, C_mch = traces["mch_fit"]
+    mch_params = traces["mch_fit"]
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.5, 4.5), facecolor="#2B2B2B")
     ax1.set_facecolor("#1E1E1E")
     ax2.set_facecolor("#1E1E1E")
 
     ax1.plot(time_axis, gfp_t_corr, 'go', alpha=0.4, label="Data")
-    if not np.isnan(k_gfp):
-        ax1.plot(time_axis, exponential_decay(time_axis, A_gfp, k_gfp, C_gfp), 'g-', label=f"k={k_gfp:.4f} frame⁻¹")
+    if fit_succeeded(gfp_params):
+        gfp_label = traces.get("gfp_fit_label") or fit_summary(gfp_params)["label"]
+        ax1.plot(time_axis, evaluate_fit(time_axis, gfp_params), 'g-', label=gfp_label)
     if traces["has_gfp_control"]:
         c_lbl = "Control (Borrowed)" if traces.get("borrowed_control") else "Control (Bleach)"
         ax1.plot(time_axis, traces["gfp_control"], 'g--', label=c_lbl)
@@ -59,8 +60,9 @@ def build_current_fit_figure(traces):
     ax1.legend(labelcolor="white", facecolor="#2B2B2B", edgecolor="none")
 
     ax2.plot(time_axis, mch_t_corr, 'ro', alpha=0.4, label="Data")
-    if not np.isnan(k_mcherry):
-        ax2.plot(time_axis, exponential_decay(time_axis, A_mch, k_mcherry, C_mch), 'r-', label=f"k={k_mcherry:.4f} frame⁻¹")
+    if fit_succeeded(mch_params):
+        mch_label = traces.get("mch_fit_label") or fit_summary(mch_params)["label"]
+        ax2.plot(time_axis, evaluate_fit(time_axis, mch_params), 'r-', label=mch_label)
     if traces["has_mch_control"]:
         c_lbl = "Control (Borrowed)" if traces.get("borrowed_control") else "Control (Bleach)"
         ax2.plot(time_axis, traces["mch_control"], 'r--', label=c_lbl)
@@ -294,9 +296,10 @@ def build_individual_decay_figure(dataset_name, traces):
     t_axis = traces["time_axis"]
 
     ax1.plot(t_axis, traces["gfp_data"], 'go', alpha=0.5, label="Data")
-    A, k, C = traces["gfp_fit"]
-    if not np.isnan(k):
-        ax1.plot(t_axis, exponential_decay(t_axis, A, k, C), 'g-', label=f"Fit (k={k:.4f} frame⁻¹)")
+    gfp_params = traces["gfp_fit"]
+    if fit_succeeded(gfp_params):
+        gfp_label = traces.get("gfp_fit_label") or fit_summary(gfp_params)["label"]
+        ax1.plot(t_axis, evaluate_fit(t_axis, gfp_params), 'g-', label=f"Fit ({gfp_label})")
     if traces["has_gfp_control"]:
         c_lbl = "Control (Borrowed)" if traces.get("borrowed_control") else "Control (Bleach)"
         ax1.plot(t_axis, traces["gfp_control"], 'g--', label=c_lbl)
@@ -307,9 +310,10 @@ def build_individual_decay_figure(dataset_name, traces):
     ax1.legend()
 
     ax2.plot(t_axis, traces["mch_data"], 'ro', alpha=0.5, label="Data")
-    A_m, k_m, C_m = traces["mch_fit"]
-    if not np.isnan(k_m):
-        ax2.plot(t_axis, exponential_decay(t_axis, A_m, k_m, C_m), 'r-', label=f"Fit (k={k_m:.4f} frame⁻¹)")
+    mch_params = traces["mch_fit"]
+    if fit_succeeded(mch_params):
+        mch_label = traces.get("mch_fit_label") or fit_summary(mch_params)["label"]
+        ax2.plot(t_axis, evaluate_fit(t_axis, mch_params), 'r-', label=f"Fit ({mch_label})")
     if traces["has_mch_control"]:
         c_lbl = "Control (Borrowed)" if traces.get("borrowed_control") else "Control (Bleach)"
         ax2.plot(t_axis, traces["mch_control"], 'r--', label=c_lbl)

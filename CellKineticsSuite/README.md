@@ -6,9 +6,11 @@ laser power, and Normoxia/Hypoxia condition, then pools replicates into
 comparative plots.
 
 Same features as the original single-file app (manual lasso selection,
-Cellpose-based auto-segmentation, fully-automatic batch mode, Box background
-sync, the analytics dashboard, publication export, session archiving) --
-this is a structural refactor, not a rewrite. It's organized so a future
+Cellpose-based auto-segmentation, fully-automatic batch mode, the analytics
+dashboard, publication export, session archiving) -- this is a structural
+refactor, not a rewrite. (Box background sync was later removed -- it never
+reliably downloaded files in the background, and the extra sidebar controls
+weren't worth keeping for a feature that didn't work.) It's organized so a future
 change to one piece (a new segmentation backend, a different fit model, a
 new export format) means editing one file with a test to prove nothing else
 silently broke, instead of tracing through a 2000-line GUI event handler to
@@ -54,7 +56,6 @@ cell_kinetics/
     thread_bridge.py         Thread-safe callback handoff (see its docstring --
                             this is the fix for a real Tcl crash that background
                             Cellpose threads were triggering)
-    box_sync.py               Background worker watching a Box-synced folder
     main_window.py             The main application window
     analytics_window.py        Pop-up fit/pooled-comparison dashboard
 tests/                      pytest suite for core/* (fast, no GUI/GPU required)

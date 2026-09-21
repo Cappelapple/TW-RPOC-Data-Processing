@@ -22,6 +22,15 @@ def pool_replicates(df):
         return None, ""
 
     df = df.copy()
+    if 'Excluded' in df.columns:
+        # A dataset excluded via the data-curation window -- e.g. a trial
+        # with a bad segmentation or an outlier control that's inflating
+        # the pooled spread. Missing/blank means "included", same as a CSV
+        # written before this column existed.
+        df = df[~df['Excluded'].fillna(False).astype(bool)]
+        if df.empty:
+            return None, ""
+
     df['Wavelength_Num'] = df['Wavelength'].astype(str).str.extract(r'(\d+)').astype(float)
 
     if 'Power_mW' in df.columns:
@@ -53,6 +62,52 @@ def pool_replicates(df):
         anomaly_msg = "\n".join(lines)
 
     return grouped, anomaly_msg
+
+
+def leave_one_out_outlier_flags(k_values_by_id):
+    """Given one group's replicate k-values (dict id -> k), find which
+    replicate(s) would shrink the group's spread the most if excluded.
+
+    This is a leave-one-out diagnostic, not "how far is this from the
+    mean" -- a raw distance-from-mean is uninformative at N=2, since both
+    points are equidistant from the mean by construction and neither one
+    can be picked out as "the" outlier that way. Removing each point in
+    turn and comparing the resulting std directly answers "which one is
+    the best candidate to exclude."
+
+    Only flags anything when the group's current std exceeds
+    STD_K_OUTLIER_THRESHOLD -- a tight group has no outlier to find. Among
+    replicates whose removal would help, only the one(s) within 90% of the
+    single best improvement are returned, so a clear lone outlier is
+    singled out while a genuine near-tie (e.g. N=2, where both points are
+    equally "the" outlier) is reported as such rather than picking one
+    arbitrarily.
+
+    Returns {id: (current_std, std_without_this_one)} for the flagged
+    replicate(s); empty if the group isn't high-spread or has fewer than
+    2 valid (non-NaN) values.
+    """
+    ids = [i for i, v in k_values_by_id.items() if pd.notna(v)]
+    if len(ids) < 2:
+        return {}
+
+    values = pd.Series({i: k_values_by_id[i] for i in ids})
+    current_std = values.std()
+    if pd.isna(current_std) or current_std <= STD_K_OUTLIER_THRESHOLD:
+        return {}
+
+    deltas = {}
+    for i in ids:
+        rest = values.drop(i)
+        new_std = rest.std() if len(rest) > 1 else 0.0
+        delta = current_std - new_std
+        if delta > 0:
+            deltas[i] = (delta, new_std)
+
+    if not deltas:
+        return {}
+    best_delta = max(d for d, _ in deltas.values())
+    return {i: (current_std, new_std) for i, (d, new_std) in deltas.items() if d >= 0.9 * best_delta}
 
 
 def get_available_wavelengths(grouped_df):

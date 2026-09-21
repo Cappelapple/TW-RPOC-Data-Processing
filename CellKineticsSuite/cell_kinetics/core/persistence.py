@@ -78,6 +78,15 @@ def append_summary_rows(folder, dataset_name, new_rows):
     master_df.to_csv(summary_path, index=False)
 
 
+def write_summary_csv(folder, df):
+    """Overwrite the summary CSV with df exactly as given. For editing
+    existing rows in place -- e.g. toggling the data-curation window's
+    Excluded flag -- as opposed to append_summary_rows, which only knows
+    how to replace-by-dataset-name when adding newly processed rows."""
+    summary_path = os.path.join(folder, SUMMARY_FILENAME)
+    df.to_csv(summary_path, index=False)
+
+
 def archive_session_files(folder):
     """Move any existing session-cache/summary files into a timestamped
     Archived_Sessions subfolder (never deletes anything).
