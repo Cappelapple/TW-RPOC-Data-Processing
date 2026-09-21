@@ -1,7 +1,0 @@
-Dataset,Wavelength,Condition,Fluorophore,Type,Decay_Constant_k
-725nm,725nm,Normoxia,GFP,Treated,0.0240302889057808
-725nm,725nm,Normoxia,GFP,Control,0.034055088166262
-725nm,725nm,Normoxia,mCherry,Treated,0.1514663945137898
-725nm,725nm,Normoxia,mCherry,Control,
-Data renamed,Unknown,Unknown,GFP,Treated,0.007432913732475712
-Data renamed,Unknown,Unknown,mCherry,Treated,0.1489184215219163

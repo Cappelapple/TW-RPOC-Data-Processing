@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Superseded by CellKineticsSuite -- kept locally for reference, not tracked
+Cell_Analyzerv14-py
+Cell_Analyzrv15.py
+Cell Analyzerv15+1-py
+Cell_Analyzer_Dashboardv12-py
+Cell_Analyzerv16.py
+FishyIshySegmentation.py
+previousversions/
