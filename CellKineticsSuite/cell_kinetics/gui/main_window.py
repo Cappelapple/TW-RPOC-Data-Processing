@@ -19,7 +19,10 @@ from matplotlib.widgets import LassoSelector
 from matplotlib.patches import Polygon
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-from ..core import fitting, metadata_parsing, dataset_io, segmentation, intensity_traces, persistence, pooling, plotting
+from ..core import fitting, metadata_parsing, dataset_io, segmentation, classic_segmentation, intensity_traces, persistence, pooling, plotting
+
+SEGMENTATION_METHOD_CELLPOSE = "Cellpose (GPU)"
+SEGMENTATION_METHODS = [SEGMENTATION_METHOD_CELLPOSE] + classic_segmentation.CLASSIC_METHODS
 from .thread_bridge import MainThreadDispatcher
 from .box_sync import BoxSyncWorker
 from .analytics_window import AnalyticsDashboardWindow
@@ -216,18 +219,24 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         self.autoseg_frame = ctk.CTkFrame(self.sidebar, fg_color="#1E1E1E", corner_radius=6)
         self.autoseg_frame.pack(pady=(4, 2), padx=15, fill="x")
 
-        lbl_autoseg = ctk.CTkLabel(self.autoseg_frame, text="Auto-Segmentation (Cellpose)", font=ctk.CTkFont(size=11, weight="bold"))
+        lbl_autoseg = ctk.CTkLabel(self.autoseg_frame, text="Auto-Segmentation", font=ctk.CTkFont(size=11, weight="bold"))
         lbl_autoseg.pack(pady=(4, 2), padx=10, anchor="w")
 
         self.seg_source_var = tk.StringVar(value="mCherry (Chromatin)")
         self.seg_source_menu = ctk.CTkOptionMenu(self.autoseg_frame, values=["mCherry (Chromatin)", "GFP (Lamin A)"], variable=self.seg_source_var)
         self.seg_source_menu.pack(pady=(0, 4), padx=10, fill="x")
 
+        lbl_method = ctk.CTkLabel(self.autoseg_frame, text="Segmentation Method:", font=ctk.CTkFont(size=10))
+        lbl_method.pack(pady=(0, 0), padx=10, anchor="w")
+        self.seg_method_var = tk.StringVar(value=SEGMENTATION_METHOD_CELLPOSE)
+        self.seg_method_menu = ctk.CTkOptionMenu(self.autoseg_frame, values=SEGMENTATION_METHODS, variable=self.seg_method_var)
+        self.seg_method_menu.pack(pady=(0, 4), padx=10, fill="x")
+
         self.autoseg_params_frame = ctk.CTkFrame(self.autoseg_frame, fg_color="transparent")
         self.autoseg_params_frame.pack(pady=0, padx=10, fill="x")
         self.autoseg_params_frame.grid_columnconfigure(0, weight=1)
 
-        lbl_diam = ctk.CTkLabel(self.autoseg_params_frame, text="Cell Diameter (px, blank=auto):", font=ctk.CTkFont(size=10))
+        lbl_diam = ctk.CTkLabel(self.autoseg_params_frame, text="Cell Diameter (px, blank=auto, Cellpose only):", font=ctk.CTkFont(size=10))
         lbl_diam.grid(row=0, column=0, sticky="w")
         self.entry_cell_diameter = ctk.CTkEntry(self.autoseg_params_frame, width=45)
         self.entry_cell_diameter.grid(row=0, column=1, sticky="e")
@@ -243,6 +252,18 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         self.entry_min_area = ctk.CTkEntry(self.autoseg_params_frame, width=45)
         self.entry_min_area.grid(row=2, column=1, sticky="e", pady=(2, 0))
         self.entry_min_area.insert(0, "40")
+
+        lbl_lowthresh = ctk.CTkLabel(self.autoseg_params_frame, text="Low Threshold % (classic only):", font=ctk.CTkFont(size=10))
+        lbl_lowthresh.grid(row=3, column=0, sticky="w", pady=(2, 0))
+        self.entry_classic_low = ctk.CTkEntry(self.autoseg_params_frame, width=45)
+        self.entry_classic_low.grid(row=3, column=1, sticky="e", pady=(2, 0))
+        self.entry_classic_low.insert(0, "20")
+
+        lbl_highthresh = ctk.CTkLabel(self.autoseg_params_frame, text="High Threshold % (classic only):", font=ctk.CTkFont(size=10))
+        lbl_highthresh.grid(row=4, column=0, sticky="w", pady=(2, 0))
+        self.entry_classic_high = ctk.CTkEntry(self.autoseg_params_frame, width=45)
+        self.entry_classic_high.grid(row=4, column=1, sticky="e", pady=(2, 0))
+        self.entry_classic_high.insert(0, "80")
 
         self.chk_auto_control = ctk.CTkCheckBox(
             self.autoseg_frame,
@@ -825,7 +846,7 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
             self.tk_canvas.draw_idle()
 
     # ==============================================================================
-    # AUTO-SEGMENTATION (CELLPOSE)
+    # AUTO-SEGMENTATION (CELLPOSE OR CLASSIC/OPENCV)
     # ==============================================================================
     def update_auto_seg_status(self, text):
         self.lbl_auto_seg_status.configure(text=text)
@@ -847,6 +868,7 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         source_frame = self.mcherry_stack[0] if "mCherry" in seg_choice else self.gfp_stack[0]
         laser_ref_frame = self.mask_frame
         dataset_snapshot = self.dataset_name
+        method = self.seg_method_var.get()
 
         diam_raw = self.entry_cell_diameter.get().strip()
         try:
@@ -854,14 +876,32 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         except ValueError:
             diameter = None
 
+        try:
+            min_area_for_seg = max(1, int(float(self.entry_min_area.get())))
+        except ValueError:
+            min_area_for_seg = 40
+        try:
+            low_pct = np.clip(float(self.entry_classic_low.get()), 0.0, 100.0) / 100.0
+        except ValueError:
+            low_pct = 0.20
+        try:
+            high_pct = np.clip(float(self.entry_classic_high.get()), 0.0, 100.0) / 100.0
+        except ValueError:
+            high_pct = 0.80
+
         self.auto_seg_running = True
         self.btn_auto_segment.configure(state="disabled", text="⏳ Segmenting...")
-        self.update_auto_seg_status(f"Running Cellpose on {seg_choice}...")
+        self.update_auto_seg_status(f"Running {method} on {seg_choice}...")
 
         def worker():
             try:
-                model = self.get_cellpose_model()
-                labels = segmentation.run_segmentation(model, source_frame, diameter=diameter)
+                if method == SEGMENTATION_METHOD_CELLPOSE:
+                    model = self.get_cellpose_model()
+                    labels = segmentation.run_segmentation(model, source_frame, diameter=diameter)
+                else:
+                    labels = classic_segmentation.run_classic_segmentation(
+                        source_frame, method, low=low_pct, high=high_pct, min_area=min_area_for_seg
+                    )
                 self.dispatcher.post(lambda: self._on_auto_segmentation_done(labels, laser_ref_frame, dataset_snapshot, on_complete))
             except Exception as e:
                 err_msg = str(e)
@@ -875,7 +915,7 @@ class AdvancedBatchCellAnalyzer(ctk.CTk):
         self.btn_auto_segment.configure(state="normal", text="\U0001f916 Auto-Segment Cells")
         self.update_auto_seg_status(f"Segmentation failed: {err_msg[:120]}")
         if not self.auto_run_active:
-            tk.messagebox.showerror("Auto-Segment Failed", f"Cellpose segmentation failed:\n{err_msg}")
+            tk.messagebox.showerror("Auto-Segment Failed", f"Segmentation failed:\n{err_msg}")
         if on_complete:
             on_complete()
 

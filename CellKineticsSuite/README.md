@@ -41,6 +41,10 @@ cell_kinetics/
     metadata_parsing.py     Wavelength/power/condition from filenames & parameter files
     dataset_io.py           Find/load dataset file triplets (GFP/mCherry/Mask/Parameters)
     segmentation.py         Cellpose wrapper + treated/control/background classification
+    classic_segmentation.py OpenCV alternative to Cellpose (threshold+components,
+                            watershed, adaptive threshold) -- same label-array
+                            contract, so classify_cells() doesn't care which
+                            backend produced the labels
     intensity_traces.py     Background-subtract -> normalize -> control-correct pipeline
     pooling.py               Group replicates, compute pooled stats
     persistence.py           Session cache, summary CSV, session archiving
