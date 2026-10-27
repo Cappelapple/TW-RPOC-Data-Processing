@@ -1,0 +1,7 @@
+from rdkit import Chem
+
+# Load single or multi-molecule SDF
+suppl = Chem.SDMolSupplier("C:\Users\calap\Downloads\E6455.sdf")
+for mol in suppl:
+    if mol is not None:
+        print(Chem.MolToSmiles(mol))
